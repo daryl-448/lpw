@@ -2,7 +2,7 @@
 
 From next-event prediction to an agent-based synthetic AML simulator.
 
-- **Status:** draft for review, 2026-11-04. No code exists yet.
+- **Status:** Phase 0 done 2026-11-04 (§5.2, [reports/p0_audit.md](reports/p0_audit.md)). Phases 1–3 not started.
 - **Inputs:** the paper digests in [papers/](papers/README.md) and the HuggingFace dataset `fesevu/ethereum_fraud_dataset_by_activity`.
 - **Hardware for the pilot:** GTX 1650 Super (4 GB VRAM, Turing sm_75, no tensor cores), 15 GB RAM, 12 CPU threads.
 
@@ -31,7 +31,7 @@ The behaviour in it is learned from data, not hand-programmed. Start small (loca
 **Non-goals for v1:**
 - ERC-20, internal or zero-value transactions. They are not in the edge data (§5.1).
 - Smart contracts as actors. Contracts never send in this data, so they are only passive counterparties.
-- Second-hop (layering) flows beyond agents' own transactions. The released E2 edges cannot identify them (§5.2).
+- Second-hop (layering) flows beyond agents' own transactions. The released E2 edges cannot identify them (§5.3).
 - Gas/fee modelling. Fees are still read, for the ledger.
 - Multi-currency and payment formats (AMLworld/TransXion).
 - Formal causal inference. FINESSE disclaims it too.
@@ -154,9 +154,32 @@ Sources: the HF API file listing, the dataset READMEs, the pipeline code at `git
 **Pre-window profile sources**
 - `lstm_dataset/monthly.parquet` has monthly features for 85,147 labeled node_ids, 2015-08 to 2025-08. It includes ERC-20 counts, internal-transaction values, peer counts and fees.
 - But `monthly` is built **from ISO weeks**, and ISO weeks cross month boundaries. For example, April includes May 1–2. So monthly rows leak activity from after a month-start cutoff, and cumulative sums count boundary weeks twice.
-- Profiles therefore come from the **daily** records instead (`lstm_dataset/daily_filtered.parquet`, or the raw `LSTM/parquet/daily_final_*`), aggregated strictly before the cutoff (§5.3).
+- Profiles therefore come from the **daily** records instead (`lstm_dataset/daily_filtered.parquet`, or the raw `LSTM/parquet/daily_final_*`), aggregated strictly before the cutoff (§5.4).
 
-### 5.2 Consequences for the design
+### 5.2 Phase 0 measurements (2026-11-04)
+
+Full numbers: [reports/p0_audit.md](reports/p0_audit.md). Raw JSON: `runs/p0_audit.json`, produced by `python -m lpw.data.slice` then `python -m lpw.data.audit`.
+
+| Item | Measured |
+|---|---|
+| Agents (non-hub EOA seeds in W) | 2,867 normal, 4,337 scam |
+| Cohorts | pre-existing: 2,819 normal, 1,476 scam. Born in W: 48 normal, 2,861 scam. |
+| Hubs → venues | 75 EOA hubs (74 normal, 1 scam), holding 64.2M events. Plus 72 shared counterparties at `S_pub = 50`. 147 venues in all. |
+| Events | 479,168: 315,897 OUT, 160,632 `IN_exo`, 2,639 `IN_agent`. Agent↔agent fraction 1.1%. 936 self-transfers. |
+| Events per agent (median) | normal 2, scam 23. 378 agents have more than 255 events. |
+| Daily records | 524,889 exact-duplicate rows (5,401 distinct) are dropped. In-W native ETH received matches E1 edges exactly (value ratio 1.0). Every pre-existing agent has a pre-W profile. |
+| `activity_end_ts` | Never earlier than the last edge. For the 2,303 agents whose activity ends inside W, the median lag is 0 days. |
+| Observed balance | Negative pre-W balance proxy for 43% of pre-existing agents. OUT events that leave the balance negative: 55% normal, 89% scam. Adding daily internal-transaction flows only brings this to 51% and 85%. |
+| Groups | Connected components fail: one component holds 47% of agents (78% scam), and it persists for every `S_pub` > 2. Louvain communities work: the largest is 9.3% of agents. 2,206 of 5,721 shared non-venue counterparties span splits. |
+| Confound | Age-only AUC 0.96 (0.92 within the pre-existing cohort). Confounder-only AUC 0.95–0.97. Matched pairs on common support: 301 train, 102 val, 99 test. |
+| Throughput (GTX 1650 Super, 0.83M-param model, fp16) | Training 68.5k tokens/s at B64×L256, so about 7 s per epoch over the slice. Batch-1 L256 pass 1.66 ms, so the sequential engine needs about 15–30 min for the pilot world. Peak memory 0.47 GB. |
+
+**Decisions taken from these measurements** (they supersede the matching text above and below):
+1. **Groups are Louvain communities** (fixed seed, label-blind) of the agent–counterparty graph after removing venues, not connected components. `component_id` is kept for reference. Leakage through shared non-venue counterparties does not affect TSTR, because the generator never sees those addresses as identities and TSTR detectors train only on synthetic data. Detectors trained on real data are also reported on the **clean test subset**: test agents with no non-venue counterparty shared with a train agent (344 normal, 327 scam).
+2. **The observed balance is an input feature only**, in every phase. With 51–89% of OUT events leaving it negative, a conservation tolerance would be meaningless, so the Phase 3 redraw rule is dropped. Labels still use the separate non-negative fund inventory (§6.7).
+3. **The confound-matched utility test is not testable in this pilot window.** The test split has 99 matched pairs, below the 200 required by §7.5. P1–P3 still run for fidelity and structure, and utility is reported with the "not testable" flag until a window with overlapping account ages is added (P5).
+
+### 5.3 Consequences for the design
 
 1. **Only seeds are full agents.** Their neighbours are partial and biased samples. Population tiers (§6.1):
    - agents are non-hub EOA seeds;
@@ -166,11 +189,11 @@ Sources: the HF API file listing, the dataset READMEs, the pipeline code at `git
 3. **Only complete data is compared.** An agent's E1 edges are complete above the dust floor, so v1 models and compares only agent-incident E1 edges (§6.8). E2 is excluded from v1 for two reasons:
    - It is not a record of forwarding episodes. It has reverse-direction transactions and transactions before the triggering transfer, and an edge missing from E2 does not mean "did not forward".
    - The released edges carry no seed provenance, and the frontier selection (ranked before the dust filter, shard-batched) cannot be replayed for a reduced seed set.
-4. **Activity-window design with two cohorts.** Normal agents are mostly old accounts. They enter the window with pre-window profiles (left-censoring). Most scam agents (2,862 of 4,338) are *born inside* the window. Both cohorts are modelled (§5.3, §6.7), and every stream is right-censored at the end of observation.
+4. **Activity-window design with two cohorts.** Normal agents are mostly old accounts. They enter the window with pre-window profiles (left-censoring). Most scam agents (2,862 of 4,338) are *born inside* the window. Both cohorts are modelled (§5.4, §6.7), and every stream is right-censored at the end of observation.
 5. **The confound is reproduced, then controlled for.** The generator conditions on account age and cohort, so it reproduces the real (age, role) joint. Utility claims use matched evaluation on common support (§7.5). Simulating young normal accounts is out of distribution in the pilot (risk R1).
 6. **The output is a native-ETH view.** Phishing approval drains (ERC-20) are invisible in it.
 
-### 5.3 Pilot slice
+### 5.4 Pilot slice
 
 **Window.** `W = [2021-05-01, 2022-05-01)` UTC, 12 months. The 12 monthly files hold 101.5M edges (about 6 GB) to download.
 
@@ -179,9 +202,9 @@ Sources: the HF API file listing, the dataset READMEs, the pipeline code at `git
    - *Hubs:* EOA seeds with more than 2,000 E1 events in any calendar month of W. They become venues. Phase 0 reports their label mix.
    - *Agents:* the remaining EOA seeds with at least 1 E1 event in W.
    - *Venues:* hubs, plus counterparties touched by at least `S_pub` distinct agents. `S_pub` is chosen from the label-blind distribution of distinct-agent degree (default 50). At most 1,024 venues, ranked by distinct agents. This step sees test agents' structure (transductive) but never their labels.
-   - *Groups:* connected components of the agent–counterparty bipartite graph after removing the venues.
+   - *Groups:* Louvain communities (fixed seed) of the agent–counterparty graph after removing the venues. Connected components were tried first and fail (§5.2).
 2. **Split by group** (scam clusters share counterparties, so a split by agent would leak). 70/15/15, stratified by role. Labels are used here only to stratify.
-3. **Train-only fitting.** Everything that uses labels or is learned is fitted on the train split only: models, quantile bins, the group prior, activation rates, the ledger tolerance and the detectors. Thresholds and model selection use the validation split (§7).
+3. **Train-only fitting.** Everything that uses labels or is learned is fitted on the train split only: models, quantile bins, the group prior, activation rates and the detectors. Thresholds and model selection use the validation split (§7).
 
 A secondary temporal check holds out the last 2 months of W, for the next-event metrics only.
 
@@ -300,7 +323,7 @@ p(next owned event | h_k) = p(kind | h) · p(time | h, kind) · p(cp | h, kind, 
 |---|---|---|
 | Owned (OUT or `IN_exo`) | `−log p(κ, t | h_k)` | Counterparty and amount NLL at this same prefix. Any `IN_agent` the event depends on, and its sender, are already inside the prefix. |
 | `IN_agent` | Censored: `−log S(t_{k+1} − t_k)` | None |
-| None (last token) | Censored at the observation end (§5.3): `−log S(T_obs − t_k)` | None |
+| None (last token) | Censored at the observation end (§5.4): `−log S(T_obs − t_k)` | None |
 
 For ended streams, the censoring time is more than 365 days, so the term equals the dormant atom's probability. A standalone Phase 1 generator never produces `IN_agent` tokens. They are about 1% of real events, so the P1 fidelity metrics compare against real streams with `IN_agent` removed.
 
@@ -324,7 +347,7 @@ v1 has no latent drift. FINESSE-style switching is listed under §10.
 
 ### 6.6 Groups and shared counterparties (Phase 3)
 
-- Real groups (§5.3) give a learned group prior: the empirical joint over group size and role mix in the train split.
+- Real groups (§5.4) give a learned group prior: the empirical joint over group size and role mix in the train split.
 - Each synthetic group gets an empty pool of group-shared nodes:
   - a member's NEW draw adds to its group's pool;
   - a member's GROUP draw picks from that pool.
@@ -356,8 +379,7 @@ Pre-existing agents start at t0 with their profile balances. Born-in-W agents en
 
 **Ledger** (the observed-balance feature): `b ← b + in − out − fee`.
 - Fees are sampled from the empirical fee distribution for the same calendar day of the real window. This is an environment input, not a behaviour.
-- Phase 1 and 2: the ledger is an input feature only.
-- Phase 3: an OUT larger than `b + tolerance` is redrawn. `tolerance` is calibrated on the train split so that the synthetic rate of negative-balance events matches the real rate measured in Phase 0. Real observed balances go negative because of unobserved flows, so a hard zero floor would be unrealistic.
+- The ledger is an input feature only, in every phase. Phase 0 found that 51–89% of real OUT events leave the observed balance negative, because of unobserved inflows (§5.2). So no conservation rule is enforced on it.
 
 **Fund inventory** (for labels only; separate from `b`). Every engine-tracked node (agents and group-shared nodes) holds a non-negative clean part `c` and tainted part `x`.
 - *Start:* pre-existing agents have `c = max(b0, 0)`, `x = 0`. Born-in-W agents and new group nodes start at 0.
@@ -448,7 +470,7 @@ Generate one stream per test agent, conditioned on its real role, cohort, activa
 
 ### 7.4 AML utility and criticism tests (P3+)
 
-- **TSTR (headline; T4).** Detectors trained on synthetic and tested on real test-split groups, for node-level illicit classification. Report AUC, AP and F1, next to train-real/test-real (TRTR). Detectors: logistic regression, random forest, XGBoost, LightGBM, and a GNN once one is feasible (Multi-GIN, as in TransXion).
+- **TSTR (headline; T4).** Detectors trained on synthetic and tested on real test-split groups, for node-level illicit classification. Report AUC, AP and F1, next to train-real/test-real (TRTR). TRTR is also reported on the clean test subset (§5.2), because real-trained detectors could exploit counterparties shared with train agents. Detectors: logistic regression, random forest, XGBoost, LightGBM, and a GNN once one is feasible (Multi-GIN, as in TransXion).
 - **Detector-ranking agreement.** Spearman correlation between the detector ranking on synthetic→synthetic and on real→real.
 - **Difficulty parity (T3).** At **matched prevalence** (the synthetic test set subsampled to the real test split's illicit rate), AP on synthetic→synthetic should be within ±0.05 of AP on real→real. Other prevalence scenarios are reported separately. LPW targets realism, not maximal hardness.
 - **Shortcut audit (C2).** Single-feature AUC for the top 20 features, synthetic vs real. Flag any |Δ| > 0.1. Template-like shortcuts show up as single features that are near-perfect in synthetic data but not in real data.
@@ -476,10 +498,10 @@ The estimates are for the GTX 1650 Super. Each one is replaced by a measurement 
 
 | Phase | Work | Exit criteria | Est. wall time | Where |
 |---|---|---|---|---|
-| **P0** Data audit + pilot slice | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.3 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
-| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | Beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | ≤ 30 min per training run; ≤ 4 h for the whole phase grid | local |
+| **P0** Data audit + pilot slice (**done**, §5.2) | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.4 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
+| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | Beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | Minutes per training run (measured: about 7 s per epoch); ≤ 4 h for the whole phase grid | local |
 | **P2** Latent types | Encoder, GMM, `z`-conditioning, ablation against no-`z`. | Keep `z` only if M9–M16 or role parity improve on validation, with nothing getting worse beyond noise. Otherwise drop it and record why. | ≤ 1 h | local |
-| **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | §7.3 metrics reported against `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. | Sequential simulation of about 7k agents for 12 months (about 0.5–1M events at an assumed 2–5 ms per batch-1 pass): 0.5–1.5 h. P0 measures the pass latency. GNN detector: 1–3 h. | local; GNN borderline |
+| **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | §7.3 metrics reported against `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. | Sequential simulation of 7.2k agents for 12 months (about 0.48M events at the measured 1.66 ms per batch-1 pass, plus overhead): 15–30 min. GNN detector: 1–3 h. | local; GNN borderline |
 | **P5** Scale-up | Multiple eras (2017–2025, about 21 GB), all non-hub seeds with an era covariate. This gives young *normal* accounts from 2017–2018 and tests extrapolation (R1). Contracts become passive sinks. | P1 and P3 metrics hold in each era. | Data build 2–4 h; training 1–3 h; simulation 3–8 h | **likely cloud** |
 
 P4 is intentionally absent: hardening moved to future work (§10).
@@ -497,7 +519,7 @@ P4 is intentionally absent: hardening moved to future work (§10).
 | R1 | Label/age confound (AUC 0.93). The pilot has almost no young normal accounts (66 born in W). | Condition on age and cohort. Matched evaluation (§7.5). Treat young-normal simulation as unvalidated until P5. |
 | R2 | Small normal population (at most 2,941 agents) | Small model, early stopping, group split. P5 adds eras. |
 | R3 | Native-ETH-only blind spot (ERC-20 approvals, internal transactions) | Documented as the scope of the output. ERC-20 counts appear only as profile fields. |
-| R4 | Observed balances are unreliable | Soft ledger with a calibrated tolerance. Labels use a separate non-negative inventory (§6.7). |
+| R4 | Observed balances are unreliable (confirmed in Phase 0: 51–89% of OUT events leave them negative) | The ledger is a feature only. Labels use a separate non-negative inventory (§6.7). |
 | R5 | The product-of-heads time law is too restrictive | Ablation A1 and baseline B2. |
 | R6 | Biased 2-hop sampling | v1 uses only complete agent-incident E1 edges (§6.8). |
 | R7 | Noisy curated labels; scam labels on token contracts | Report the description mix. Contracts are out of pilot scope. |
