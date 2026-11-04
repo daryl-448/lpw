@@ -2,7 +2,7 @@
 
 From next-event prediction to an agent-based synthetic AML simulator.
 
-- **Status:** Phase 0 done 2026-11-04 (§5.2, [reports/p0_audit.md](reports/p0_audit.md)). Phases 1–3 not started.
+- **Status:** Phase 0 done 2026-11-04 for two pilot slices, 2021 and 2018 (§5.2, [reports/p0_audit.md](reports/p0_audit.md)). Phases 1–3 not started.
 - **Inputs:** the paper digests in [papers/](papers/README.md) and the HuggingFace dataset `fesevu/ethereum_fraud_dataset_by_activity`.
 - **Hardware for the pilot:** GTX 1650 Super (4 GB VRAM, Turing sm_75, no tensor cores), 15 GB RAM, 12 CPU threads.
 
@@ -158,26 +158,31 @@ Sources: the HF API file listing, the dataset READMEs, the pipeline code at `git
 
 ### 5.2 Phase 0 measurements (2026-11-04)
 
-Full numbers: [reports/p0_audit.md](reports/p0_audit.md). Raw JSON: `runs/p0_audit.json`, produced by `python -m lpw.data.slice` then `python -m lpw.data.audit`.
+Full numbers: [reports/p0_audit.md](reports/p0_audit.md). Raw JSON: `runs/p0_audit.json` (2021) and `runs/p0_audit_2018.json` (2018), produced by `python -m lpw.data.slice` then `python -m lpw.data.audit` (commands in the report). Builds are deterministic.
 
-| Item | Measured |
-|---|---|
-| Agents (non-hub EOA seeds in W) | 2,867 normal, 4,337 scam |
-| Cohorts | pre-existing: 2,819 normal, 1,476 scam. Born in W: 48 normal, 2,861 scam. |
-| Hubs → venues | 75 EOA hubs (74 normal, 1 scam), holding 64.2M events. Plus 72 shared counterparties at `S_pub = 50`. 147 venues in all. |
-| Events | 479,168: 315,897 OUT, 160,632 `IN_exo`, 2,639 `IN_agent`. Agent↔agent fraction 1.1%. 936 self-transfers. |
-| Events per agent (median) | normal 2, scam 23. 378 agents have more than 255 events. |
-| Daily records | 524,889 exact-duplicate rows (5,401 distinct) are dropped. In-W native ETH received matches E1 edges exactly (value ratio 1.0). Every pre-existing agent has a pre-W profile. |
-| `activity_end_ts` | Never earlier than the last edge. For the 2,303 agents whose activity ends inside W, the median lag is 0 days. |
-| Observed balance | Negative pre-W balance proxy for 43% of pre-existing agents. OUT events that leave the balance negative: 55% normal, 89% scam. Adding daily internal-transaction flows only brings this to 51% and 85%. |
-| Groups | Connected components fail: one component holds 47% of agents (78% scam), and it persists for every `S_pub` > 2. Louvain communities work: the largest is 9.3% of agents. 2,206 of 5,721 shared non-venue counterparties span splits. |
-| Confound | Age-only AUC 0.96 (0.92 within the pre-existing cohort). Confounder-only AUC 0.95–0.97. Matched pairs on common support: 312 train, 85 val, 107 test. |
-| Throughput (GTX 1650 Super, 0.83M-param model, fp16) | Training 68.5k tokens/s at B64×L256, so about 7 s per epoch over the slice. Batch-1 L256 pass 1.66 ms, so the sequential engine needs about 15–30 min for the pilot world. Peak memory 0.47 GB. |
+There are two pilot slices (§5.4): the **2021 slice**, W = [2021-05-01, 2022-05-01), and the **2018 slice**, W = [2018-01-01, 2019-01-01).
+
+| Item | 2021 slice | 2018 slice |
+|---|---|---|
+| Agents (non-hub EOA seeds in W) | 2,867 normal, 4,337 scam (60% scam) | 22,610 normal, 2,326 scam (9.3% scam) |
+| Cohorts, pre-existing / born in W | normal 2,819 / 48; scam 1,476 / 2,861 | normal 6,515 / 16,095; scam 219 / 2,107 |
+| Hubs → venues | 75 EOA hubs (74 normal, 1 scam), 64.2M events. Plus 72 shared counterparties at `S_pub = 50`: 147 venues. | 117 hubs (114 normal, 3 scam), 23.6M events. Plus 165 shared: 282 venues. |
+| Events | 479,168: 315,897 OUT, 160,632 `IN_exo`, 2,639 `IN_agent`. Agent↔agent 1.1%. | 478,951: 219,558 OUT, 257,711 `IN_exo`, 1,682 `IN_agent`. Agent↔agent 0.7%. |
+| Events per agent (median) | normal 2, scam 23. 378 agents over 255 events. | normal 3, scam 8. 260 agents over 255 events. |
+| Daily records | 524,889 exact-duplicate rows (5,401 distinct) are dropped. In-W native ETH received matches E1 edges exactly (value ratio 1.0). Every pre-existing agent has a pre-W profile. | Same. |
+| `activity_end_ts` | Never earlier than the last edge. 2,303 agents end inside W, median lag 0 days. | Same check passes. 11,567 end inside W, median lag 0 days. |
+| Observed balance | Pre-W proxy negative for 43% of pre-existing agents. OUT events leaving it negative: 55% normal, 89% scam (51% and 85% with internal flows). | Proxy negative for 16%. OUT events leaving it negative: 26% normal, 32% scam. |
+| Groups | Connected components fail: one holds 47% of agents (78% scam) for every `S_pub` > 2. Louvain: largest community 9.3% of agents. 2,261 of 5,721 shared non-venue counterparties span splits. | Louvain: largest 2.7%. 1,059 of 9,412 span splits. |
+| Clean test subset (no non-venue counterparty shared with train) | 316 normal, 334 scam | 2,539 normal, 270 scam |
+| Confound | Age-only AUC 0.96 (0.92 within pre-existing). Confounder-only AUC 0.96–0.97. Matched pairs: 347 train, 93 val, **62 test**. | Age-only AUC 0.60 (0.50 within pre-existing). Confounder-only AUC 0.61. Matched pairs: 1,607 train, 348 val, **348 test**. |
+| Throughput (GTX 1650 Super, 0.83M-param model, fp16) | Training 68.5k tokens/s at B64×L256, so about 7 s per epoch per slice. Batch-1 L256 pass 1.66 ms, so the sequential engine needs about 15–30 min per slice. Peak memory 0.47 GB. | (same model and GPU) |
+
+The eras differ in behaviour, not just in mix. 2021 scam agents are busy, repeat counterparties (median repeat rate 0.43) and lean on shared counterparties. 2018 scam agents are quieter, rarely repeat (0.08) and mostly receive (median out-fraction 0.33).
 
 **Decisions taken from these measurements** (they supersede the matching text above and below):
-1. **Groups are Louvain communities** (fixed seed, label-blind) of the agent–counterparty graph after removing venues, not connected components. `component_id` is kept for reference. Leakage through shared non-venue counterparties does not affect TSTR, because the generator never sees those addresses as identities and TSTR detectors train only on synthetic data. Detectors trained on real data are also reported on the **clean test subset**: test agents with no non-venue counterparty shared with a train agent (344 normal, 327 scam).
-2. **The observed balance is an input feature only**, in every phase. With 51–89% of OUT events leaving it negative, a conservation tolerance would be meaningless, so the Phase 3 redraw rule is dropped. Labels still use the separate non-negative fund inventory (§6.7).
-3. **The confound-matched utility test is not testable in this pilot window.** The test split has 107 matched pairs, below the 200 required by §7.5. P1–P3 still run for fidelity and structure, and utility is reported with the "not testable" flag until a window with overlapping account ages is added (P5).
+1. **Groups are Louvain communities** (fixed seed, label-blind, inputs sorted so the result does not depend on row order) of the agent–counterparty graph after removing venues, not connected components. `component_id` is kept for reference. Leakage through shared non-venue counterparties does not affect TSTR, because the generator never sees those addresses as identities and TSTR detectors train only on synthetic data. Detectors trained on real data are also reported on each slice's **clean test subset**.
+2. **The observed balance is an input feature only**, in every phase and both slices. With 26–89% of OUT events leaving it negative, a conservation tolerance would be meaningless, so the Phase 3 redraw rule is dropped. Labels still use the separate non-negative fund inventory (§6.7).
+3. **Two slices, with different jobs.** The 2021 slice cannot support the confound-matched utility test (62 matched test pairs, below the 200 that §7.5 requires); the 2018 slice can (348). Both slices run P1–P3 with the same code and preprocessing. Utility claims under §7.5 come from the **2018 slice**. The 2021 slice reports them with the "not testable" flag, and serves as the scam-dense, high-repeat stress case for fidelity and world structure. Models are trained per slice; a shared model with an era covariate is P5.
 
 ### 5.3 Consequences for the design
 
@@ -189,13 +194,17 @@ Full numbers: [reports/p0_audit.md](reports/p0_audit.md). Raw JSON: `runs/p0_aud
 3. **Only complete data is compared.** An agent's E1 edges are complete above the dust floor, so v1 models and compares only agent-incident E1 edges (§6.8). E2 is excluded from v1 for two reasons:
    - It is not a record of forwarding episodes. It has reverse-direction transactions and transactions before the triggering transfer, and an edge missing from E2 does not mean "did not forward".
    - The released edges carry no seed provenance, and the frontier selection (ranked before the dust filter, shard-batched) cannot be replayed for a reduced seed set.
-4. **Activity-window design with two cohorts.** Normal agents are mostly old accounts. They enter the window with pre-window profiles (left-censoring). Most scam agents (2,862 of 4,338) are *born inside* the window. Both cohorts are modelled (§5.4, §6.7), and every stream is right-censored at the end of observation.
-5. **The confound is reproduced, then controlled for.** The generator conditions on account age and cohort, so it reproduces the real (age, role) joint. Utility claims use matched evaluation on common support (§7.5). Simulating young normal accounts is out of distribution in the pilot (risk R1).
+4. **Activity-window design with two cohorts.** In 2021, normal agents are mostly old accounts. They enter the window with pre-window profiles (left-censoring), and most scam agents (2,861 of 4,337) are *born inside* the window. In 2018, most agents of both roles are born inside the window (16,095 of 22,610 normal, 2,107 of 2,326 scam). Both cohorts are modelled (§5.4, §6.7), and every stream is right-censored at the end of observation.
+5. **The confound is reproduced, then controlled for.** The generator conditions on account age and cohort, so it reproduces the real (age, role) joint. Utility claims use matched evaluation on common support (§7.5). Young normal accounts are almost absent from the 2021 slice but common in the 2018 slice, so they are validated there (risk R1).
 6. **The output is a native-ETH view.** Phishing approval drains (ERC-20) are invisible in it.
 
 ### 5.4 Pilot slice
 
-**Window.** `W = [2021-05-01, 2022-05-01)` UTC, 12 months. The 12 monthly files hold 101.5M edges (about 6 GB) to download.
+**Windows.** Two slices, each 12 months UTC, built independently with the same preprocessing below (`--window` in `lpw.data.slice`):
+- **2021 slice:** `W = [2021-05-01, 2022-05-01)`. 12 monthly files, 101.5M edges, about 6 GB. Output `data/pilot`.
+- **2018 slice:** `W = [2018-01-01, 2019-01-01)`. 12 monthly files, 29.3M edges, 1.5 GB. Output `data/pilot_2018`. It was chosen by scanning candidate windows for matched-pair yield: 2017-07..2018-07 gave about 274 estimated test pairs, 2018-01..2019-01 about 346, and every window from 2019 on 47–83.
+
+`W` below means the window of whichever slice is being built.
 
 **Preprocessing order.** It runs one way and is frozen afterwards:
 1. **Label-blind structural preprocessing**, on all W data. Labels are not used.
@@ -224,7 +233,7 @@ A secondary temporal check holds out the last 2 months of W, for the next-event 
   The born-in-W cohort has an empty profile: age 0, no prior activity, balance 0. Phase 0 checks the sign of the balance proxy, its consistency with edge sums, and the coverage of the daily files.
 - *Observation end:* W end. For an agent whose `activity_end_ts` falls inside W, it is instead the data end (2025-08-18), because the data show no activity after that date. Phase 0 checks `activity_end_ts` against the last edge.
 
-**Expected scale.** At most 2,941 normal and 4,338 scam agents (the W cohort before hub exclusion), and about 0.5–1M event tokens. 2021-10 alone had 58k non-hub EOA events. Phase 0 measures the real numbers.
+**Scale (measured, §5.2).** 2021: 7,204 agents, 479k events. 2018: 24,936 agents, 479k events.
 
 ## 6. Design
 
@@ -488,7 +497,7 @@ Account age, era, cohort and their proxies are strongly confounded with the labe
 2. without age, era, cohort and proxy features;
 3. **matched on common support.** Fit a propensity model for role on age, era, cohort and the proxies, using the train split. Trim to overlapping propensity, match illicit and normal agents, and report the effective N per role.
 
-The **conditional baseline** is a detector that uses only those confounder features, evaluated in the same matched sample. Behavioural signal is the full detector's gain over that baseline inside the matched sample. If the matched sample has fewer than 200 agents per role, the claim is reported as "not testable in the pilot" and deferred to P5.
+The **conditional baseline** is a detector that uses only those confounder features, evaluated in the same matched sample. Behavioural signal is the full detector's gain over that baseline inside the matched sample. If the matched sample has fewer than 200 agents per role, the claim is reported as "not testable" for that slice. In the pilot this applies to the 2021 slice; the 2018 slice is the one that carries the utility claims (§5.2).
 
 The thresholds in §7 are initial targets, recalibrated on validation data once P1 results and noise floors exist. Any change is recorded in this file.
 
@@ -498,11 +507,11 @@ The estimates are for the GTX 1650 Super. Each one is replaced by a measurement 
 
 | Phase | Work | Exit criteria | Est. wall time | Where |
 |---|---|---|---|---|
-| **P0** Data audit + pilot slice (**done**, §5.2) | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.4 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
-| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | Beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | Minutes per training run (measured: about 7 s per epoch); ≤ 4 h for the whole phase grid | local |
+| **P0** Data audit + pilot slices (**done** for 2021 and 2018, §5.2) | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB for 2021, 1.5 GB for 2018) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.4 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
+| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | On each slice: beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | Minutes per training run (measured: about 7 s per epoch per slice); ≤ 4 h for the whole phase grid across both slices | local |
 | **P2** Latent types | Encoder, GMM, `z`-conditioning, ablation against no-`z`. | Keep `z` only if M9–M16 or role parity improve on validation, with nothing getting worse beyond noise. Otherwise drop it and record why. | ≤ 1 h | local |
-| **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | §7.3 metrics reported against `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. | Sequential simulation of 7.2k agents for 12 months (about 0.48M events at the measured 1.66 ms per batch-1 pass, plus overhead): 15–30 min. GNN detector: 1–3 h. | local; GNN borderline |
-| **P5** Scale-up | Multiple eras (2017–2025, about 21 GB), all non-hub seeds with an era covariate. This gives young *normal* accounts from 2017–2018 and tests extrapolation (R1). Contracts become passive sinks. | P1 and P3 metrics hold in each era. | Data build 2–4 h; training 1–3 h; simulation 3–8 h | **likely cloud** |
+| **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | On each slice, §7.3 metrics reported against that slice's `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. The §7.5 matched utility result comes from the 2018 slice. | Sequential simulation per slice (7.2k agents in 2021 and 24.9k in 2018, each about 0.48M events at the measured 1.66 ms per batch-1 pass, plus overhead): 15–30 min each. GNN detector: 1–3 h. | local; GNN borderline |
+| **P5** Scale-up | Multiple eras (2017–2025, about 21 GB), all non-hub seeds in one model with an era covariate, which tests transfer across eras. Contracts become passive sinks. | P1 and P3 metrics hold in each era. | Data build 2–4 h; training 1–3 h; simulation 3–8 h | **likely cloud** |
 
 P4 is intentionally absent: hardening moved to future work (§10).
 
@@ -516,8 +525,8 @@ P4 is intentionally absent: hardening moved to future work (§10).
 
 | ID | Risk | Mitigation |
 |---|---|---|
-| R1 | Label/age confound (AUC 0.93). The pilot has almost no young normal accounts (66 born in W). | Condition on age and cohort. Matched evaluation (§7.5). Treat young-normal simulation as unvalidated until P5. |
-| R2 | Small normal population (at most 2,941 agents) | Small model, early stopping, group split. P5 adds eras. |
+| R1 | Label/age confound: age-only AUC 0.96 in the 2021 slice, which has almost no young normal accounts (48 born in W). | Condition on age and cohort. Matched evaluation (§7.5) on the 2018 slice, where age-only AUC is 0.60 and 16k normal accounts are born in W. |
+| R2 | Small populations: 2,867 normal agents in 2021, 2,326 scam agents in 2018 | Small model, early stopping, group split. P5 adds eras. |
 | R3 | Native-ETH-only blind spot (ERC-20 approvals, internal transactions) | Documented as the scope of the output. ERC-20 counts appear only as profile fields. |
 | R4 | Observed balances are unreliable (confirmed in Phase 0: 51–89% of OUT events leave them negative) | The ledger is a feature only. Labels use a separate non-negative inventory (§6.7). |
 | R5 | The product-of-heads time law is too restrictive | Ablation A1 and baseline B2. |

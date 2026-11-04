@@ -26,3 +26,21 @@ def test_caliper_pairs_handles_ties():
     assert caliper_pairs(np.zeros(100), np.zeros(100), 0.01) == 100
     assert caliper_pairs(np.array([0.0, 1.0]), np.array([0.5]), 0.4) == 0
     assert caliper_pairs(np.array([0.0, 1.0, 2.0]), np.array([0.1, 2.05]), 0.2) == 2
+
+
+def test_split_and_groups_ignore_row_order():
+    import networkx  # noqa: F401  (find_groups needs it)
+
+    from lpw.data.slice import find_groups
+    rows = [(i, (i * 7) % 50, int(i % 3 == 0)) for i in range(600)]
+    a = pl.DataFrame(rows, schema=["node_id", "group_id", "is_scam"], orient="row")
+    base = split_groups(a).sort("node_id")["split"]
+    for seed in range(3):
+        assert split_groups(a.sample(fraction=1.0, shuffle=True, seed=seed)).sort("node_id")["split"].equals(base)
+    ev = pl.DataFrame({"node_id": [1, 1, 2, 3, 3, 4, 5, 6], "cp": [10, 11, 10, 12, 4, 13, 6, 14]},
+                      schema={"node_id": pl.UInt64, "cp": pl.UInt64})
+    venues = pl.Series([], dtype=pl.UInt64)
+    g0 = find_groups(ev, venues).sort("node_id")
+    for seed in range(3):
+        g = find_groups(ev.sample(fraction=1.0, shuffle=True, seed=seed), venues).sort("node_id")
+        assert g.equals(g0)

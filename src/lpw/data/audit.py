@@ -12,7 +12,7 @@ import polars as pl
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from lpw.data.slice import W_END, W_START
+from lpw.data import slice as sl
 
 
 def q(s: pl.Series, qs=(0.1, 0.25, 0.5, 0.75, 0.9, 0.99)) -> dict:
@@ -85,10 +85,10 @@ def activity_end_check(ev: pl.DataFrame, a: pl.DataFrame) -> dict:
         pl.from_epoch("first_ts", time_unit="s").dt.replace_time_zone("UTC").alias("first_dt"))
     return {
         "activity_end_null": int(x["activity_end_ts"].is_null().sum()),
-        "activity_end_inside_W": by_role(x, (pl.col("activity_end_ts") < W_END).sum(), "n"),
+        "activity_end_inside_W": by_role(x, (pl.col("activity_end_ts") < sl.W_END).sum(), "n"),
         "last_edge_after_activity_end": int((x["last_dt"] > x["activity_end_ts"]).sum()),
         "first_edge_before_activity_start": int((x["first_dt"] < x["activity_start_ts"]).sum()),
-        "lag_last_edge_to_activity_end_days_if_end_in_W": q(x.filter(pl.col("activity_end_ts") < W_END)
+        "lag_last_edge_to_activity_end_days_if_end_in_W": q(x.filter(pl.col("activity_end_ts") < sl.W_END)
                                                             .select((pl.col("activity_end_ts") - pl.col("last_dt")).dt.total_seconds() / 86400).to_series()),
     }
 
@@ -115,7 +115,7 @@ def ledger_check(ev: pl.DataFrame, prof: pl.DataFrame, a: pl.DataFrame) -> dict:
 def daily_vs_edges(raw: Path, ev: pl.DataFrame, a: pl.DataFrame) -> dict:
     """Compare in-W native ETH received per agent: daily records vs E1 edges (≥ dust)."""
     d = (pl.scan_parquet(raw / "lstm_dataset/daily_filtered.parquet")
-         .filter(pl.col("node_id").is_in(a["node_id"].implode()), pl.col("day") >= W_START.date(), pl.col("day") < W_END.date())
+         .filter(pl.col("node_id").is_in(a["node_id"].implode()), pl.col("day") >= sl.W_START.date(), pl.col("day") < sl.W_END.date())
          .drop("address", "week", "month").unique()
          .group_by("node_id").agg(pl.col("eth_recv_sum").cast(pl.Float64).sum().alias("daily_recv"),
                                   pl.col("normal_recv_cnt").sum().alias("daily_recv_cnt"))
@@ -214,6 +214,8 @@ def main() -> None:
     ap.add_argument("--out", default="runs/p0_audit.json")
     args = ap.parse_args()
     raw, pilot = Path(args.raw), Path(args.pilot)
+    meta = json.loads((pilot / "meta.json").read_text())
+    sl.set_window(f"{meta['W_START'][:7]}:{meta['W_END'][:7]}")
     ev = pl.read_parquet(pilot / "events.parquet")
     a = pl.read_parquet(pilot / "agents.parquet")
     prof = pl.read_parquet(pilot / "profiles.parquet")
@@ -221,7 +223,7 @@ def main() -> None:
     hubs = pl.read_parquet(pilot / "hubs.parquet")
     lab = pl.read_parquet(raw / "gnn_dataset/labels/targets_global.parquet")
     mt = pl.read_parquet(raw / "gnn_dataset/targets/month_targets.parquet").join(lab, on="node_id")
-    w = mt.filter(pl.col("month") >= "2021-05", pl.col("month") <= "2022-04", pl.col("is_contract") == 0).unique("node_id")
+    w = mt.filter(pl.col("month").is_in(sl.months(sl.W_START, sl.W_END)), pl.col("is_contract") == 0).unique("node_id")
     report = {
         "meta": json.loads((pilot / "meta.json").read_text()),
         "month_targets_W_EOAs": by_role(w, pl.len(), "n"),

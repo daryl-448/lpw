@@ -5,7 +5,8 @@ Order (frozen, one way):
   2. split by group, stratified by role
   3. (train-only fitting happens in later phases, not here)
 
-Usage: uv run python -m lpw.data.slice [--raw data/raw] [--out data/pilot]
+Usage: uv run python -m lpw.data.slice [--raw data/raw] [--out data/pilot] [--window 2021-05:2022-05]
+(the window end month is exclusive)
 """
 
 import argparse
@@ -19,6 +20,16 @@ import networkx as nx
 
 W_START = datetime(2021, 5, 1, tzinfo=timezone.utc)
 W_END = datetime(2022, 5, 1, tzinfo=timezone.utc)
+
+
+def set_window(spec: str) -> None:
+    """Set the module window from 'YYYY-MM:YYYY-MM' (end exclusive). Other modules read lpw.data.slice.W_START/W_END."""
+    global W_START, W_END
+    a, b = spec.split(":")
+    W_START = datetime(int(a[:4]), int(a[5:7]), 1, tzinfo=timezone.utc)
+    W_END = datetime(int(b[:4]), int(b[5:7]), 1, tzinfo=timezone.utc)
+
+
 DATA_END = datetime(2025, 8, 18, tzinfo=timezone.utc)  # last edge ts in the dataset (1755475139)
 HUB_MONTHLY_EVENTS = 2000
 S_PUB = 50
@@ -97,16 +108,17 @@ def find_groups(ev: pl.DataFrame, venues: pl.Series) -> pl.DataFrame:
     Plain connected components do not work: Phase 0 found one component holding 47% of agents, and it persists
     for every venue threshold above 2. The component id is kept as `component_id` for reference.
     """
-    pairs = ev.filter(~pl.col("cp").is_in(venues.implode())).select("node_id", "cp").unique()
-    agent_ids = ev["node_id"].unique()
+    # polars unique() row order is not stable across runs, and Louvain depends on insertion order: sort everything.
+    pairs = ev.filter(~pl.col("cp").is_in(venues.implode())).select("node_id", "cp").unique().sort("node_id", "cp")
+    agent_ids = ev["node_id"].unique().sort()
     agent_set = set(agent_ids.to_list())
     G = nx.Graph()
-    G.add_nodes_from(("a", n) for n in agent_set)
+    G.add_nodes_from(("a", n) for n in agent_ids.to_list())
     G.add_edges_from((("a", n), ("a", c) if c in agent_set else ("c", c)) for n, c in pairs.iter_rows())
-    comms = nx.community.louvain_communities(G, seed=SEED)
+    comms = sorted(nx.community.louvain_communities(G, seed=SEED), key=lambda cs: min(cs))
     comm = pl.DataFrame([(n[1], i) for i, cs in enumerate(comms) for n in cs if n[0] == "a"],
                         schema=[("node_id", pl.UInt64), ("group_id", pl.Int64)], orient="row")
-    comp = {n[1]: i for i, cs in enumerate(nx.connected_components(G)) for n in cs if n[0] == "a"}
+    comp = {n[1]: i for i, cs in enumerate(sorted(nx.connected_components(G), key=lambda cs: min(cs))) for n in cs if n[0] == "a"}
     comp_df = pl.DataFrame({"node_id": list(comp), "component_id": list(comp.values())}, schema={"node_id": pl.UInt64, "component_id": pl.Int64})
     return pl.DataFrame({"node_id": agent_ids}).join(comm, on="node_id").join(comp_df, on="node_id")
 
@@ -141,7 +153,7 @@ def profiles(raw: Path, agents: pl.DataFrame) -> pl.DataFrame:
 
 def split_groups(agents: pl.DataFrame) -> pl.DataFrame:
     """Assign whole groups to splits, greedily balancing per-role counts against the target fractions."""
-    g = agents.group_by("group_id").agg(pl.col("is_scam").sum().alias("n_scam"), (1 - pl.col("is_scam")).sum().alias("n_norm"))
+    g = agents.group_by("group_id").agg(pl.col("is_scam").sum().alias("n_scam"), (1 - pl.col("is_scam")).sum().alias("n_norm")).sort("group_id")
     rng = np.random.default_rng(SEED)
     g = g.with_columns(pl.Series("r", rng.random(g.height))).sort(pl.col("n_scam") + pl.col("n_norm"), "r", descending=[True, False])
     tot = np.array([g["n_scam"].sum(), g["n_norm"].sum()], dtype=float)
@@ -162,7 +174,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="data/raw")
     ap.add_argument("--out", default="data/pilot")
+    ap.add_argument("--window", default="2021-05:2022-05")
     args = ap.parse_args()
+    set_window(args.window)
     raw, out = Path(args.raw), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     files = edge_files(raw)
