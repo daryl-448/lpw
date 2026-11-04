@@ -57,7 +57,8 @@ There are 18 files in `data/raw/` (5.8 GB). Each one was checked against the sha
 - **Confound.**
   - Age-only AUC is 0.960, and 0.915 within the pre-existing cohort.
   - A confounder-only logistic model (age, cohort, proxies, missingness) scores AUC 0.966 on train, 0.956 on val and 0.947 on test.
-  - 1:1 caliper matching on common support gives 280 train, 78 val and **99 test** pairs. That is below the 200 that SPEC §7.5 requires, so the confound-matched utility claim is **not testable in this window**.
+  - 1:1 caliper matching on common support gives 312 train, 85 val and **107 test** pairs. That is below the 200 that SPEC §7.5 requires, so the confound-matched utility claim is **not testable in this window**.
+  - Correction: a first version of the matcher only searched the 20 nearest candidates. That undercounts when many scores tie, and it reported 99 test pairs. It now uses the exact sorted two-pointer method (`caliper_pairs`, unit-tested).
 
 ## Throughput (GTX 1650 Super)
 
