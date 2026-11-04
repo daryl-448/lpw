@@ -465,6 +465,8 @@ Generate one stream per test agent, conditioned on its real role, cohort, activa
 | M15 | monthly net flow per agent (Banksformer cash-flow analogue) | W1 |
 | M16 | end-of-window observed balance (sweeping) | W1 |
 
+**Units.** Events per agent and distinct counterparties (M10, M11) are compared as `log1p` counts. Monthly net flow and end balance (M15, M16) are compared as signed `log1p` ETH. On a raw scale, W1 on these heavy-tailed quantities is set by a few whale accounts, so both the noise floor and the test become blind to typical accounts. Real and synthetic go through the same transform. M15 covers every agent-month from the agent's origin to the window end, with inactive months counted as 0. M10 counts zero-event agents as having 0 counterparties. M1 passes only if the overall, OUT and `IN_exo` amount distributions all pass.
+
 **Role-signal parity.** Train XGBoost on real-train per-agent summaries (M9–M16 features plus profile) to predict role. Compare its AUC on real test with its AUC on synthetic agents. A large gap in either direction is a failure: a higher synthetic AUC means caricature; a lower one means the signal was lost.
 
 ### 7.3 World structure (P3; on O(world) vs R_W)

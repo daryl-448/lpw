@@ -11,6 +11,8 @@ dependencies = [
     "torch",
     "pyyaml",
     "networkx>=3.7",
+    "xgboost>=3.4.1",
+    "scipy>=1.18.1",
 ]
 
 [dependency-groups]

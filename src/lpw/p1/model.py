@@ -1,0 +1,370 @@
+"""Policy model and baselines (SPEC §6.3, §7.1).
+
+  lpw  transformer, product time law with weekly weight, REPEAT/VENUE/NEW counterparty head, 8-Gaussian amount
+  a1   lpw with w ≡ 1 (Δt only)
+  a3   lpw with a single-Gaussian amount
+  b0   per-role marginals with Markov-1 on kind (kind head sees role and previous token kind; all other heads
+       see role and target kind only; uniform pointer)
+  b1   GRU encoder with the lpw heads
+  b2   Banksformer-adapted: Δt / hour / dow heads trained independently by cross-entropy on uncensored prefixes,
+       no counterparty head, single-Gaussian amount. Scored through the same normalized law as everyone else.
+
+Row types: 1 owned target, 2 censored by an IN_agent delivery, 3 censored at observation end, 0 sampling (no target).
+"""
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from lpw.p1.batch import CTX, N_TIME_CONT, N_TOK_CONT
+from lpw.p1.store import DUST_LOG10, OUT, PAD, REPEAT, VENUE
+from lpw.p1.timelaw import EDGES, TimeLaw
+
+N_PHI = 18
+DK = 64
+
+
+@dataclass
+class Cfg:
+    name: str = "lpw"
+    enc: str = "tf"        # tf | gru | marg
+    week: bool = True      # False = A1
+    k_mix: int = 8         # 1 = A3
+    b2: bool = False
+    d: int = 128
+    layers: int = 4
+    heads: int = 4
+    ff: int = 512
+    dropout: float = 0.1
+
+
+CONFIGS = {
+    "lpw": Cfg("lpw"),
+    "a1": Cfg("a1", week=False),
+    "a3": Cfg("a3", k_mix=1),
+    "b0": Cfg("b0", enc="marg"),
+    "b1": Cfg("b1", enc="gru"),
+    "b2": Cfg("b2", k_mix=1, b2=True),
+}
+
+
+def mlp(i, h, o):
+    return nn.Sequential(nn.Linear(i, h), nn.GELU(), nn.Linear(h, o))
+
+
+def phi(count, rec, tin, tout, tier, in_ctx):
+    """Partner-entry features (…, N_PHI): log count, log recency (+ RBF expansion), log totals, tier, in-context flag."""
+    lc = torch.log1p(count)
+    lr = torch.log1p(torch.clamp(rec, min=0).float())
+    centers = torch.linspace(0, 17.5, 10, device=count.device)
+    rbf = torch.exp(-(((lr[..., None] - centers) / 1.75) ** 2))
+    t1 = F.one_hot(tier.clamp(0, 3), 4)[..., :3].float()
+    return torch.cat([lc[..., None] / 3, lr[..., None] / 17, rbf, torch.log1p(tin)[..., None] / 5,
+                      torch.log1p(tout)[..., None] / 5, t1, in_ctx[..., None].float()], -1)
+
+
+def trunc_mog_logpdf(params, a, k):
+    logit, mu, ls = params.split(k, -1)
+    sig = torch.exp(ls.clamp(-4, 2))
+    lw = torch.log_softmax(logit, -1)
+    lp = lw - 0.5 * ((a[:, None] - mu) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
+    tail = torch.logsumexp(lw + torch.special.log_ndtr((mu - DUST_LOG10) / sig), -1)
+    return torch.logsumexp(lp, -1) - tail
+
+
+def gauss_logpdf(params, a):
+    _, mu, ls = params.split(1, -1)
+    sig = torch.exp(ls.clamp(-4, 2))[:, 0]
+    return -0.5 * ((a - mu[:, 0]) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
+
+
+def mog_mean(params, k):
+    logit, mu, _ = params.split(k, -1)
+    return (torch.softmax(logit, -1) * mu).sum(-1).clamp(min=DUST_LOG10)
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Cfg, n_venues: int, n_prof: int, venue_sc: torch.Tensor):
+        super().__init__()
+        self.cfg = cfg
+        d = cfg.d
+        V = n_venues
+        self.V = V
+        self.register_buffer("venue_sc", venue_sc.bool())
+        self.e_kind = nn.Embedding(5, d)
+        self.e_cls = nn.Embedding(4, d)
+        self.e_venue = nn.Embedding(V + 1, d)
+        self.e_tier = nn.Embedding(4, d)
+        self.e_dtbin = nn.Embedding(65, d)
+        self.e_month = nn.Embedding(13, d)
+        self.tok_cont = nn.Linear(N_TOK_CONT, d)
+        self.e_role = nn.Embedding(2, d)
+        self.e_cohort = nn.Embedding(2, d)
+        self.prof_mlp = mlp(n_prof + 6, d, d)
+        self.pos = nn.Embedding(CTX + 1, d)
+        if cfg.enc == "tf":
+            layer = nn.TransformerEncoderLayer(d, cfg.heads, cfg.ff, cfg.dropout, batch_first=True, norm_first=True)
+            self.enc = nn.TransformerEncoder(layer, cfg.layers, enable_nested_tensor=False)
+            self.ln = nn.LayerNorm(d)
+        elif cfg.enc == "gru":
+            self.enc = nn.GRU(d, d, 2, batch_first=True, dropout=cfg.dropout)
+            self.ln = nn.LayerNorm(d)
+        else:
+            self.m_kind = nn.Embedding(2 * 5, d)
+            self.m_role = nn.Embedding(2, d)
+        self.kind_head = mlp(d, d, 2)
+        self.e_tkind = nn.Embedding(2, d)
+        self.time_head = mlp(2 * d, d, 64 + 24 + 7)
+        self.e_tbin = nn.Embedding(64, d)
+        self.e_tmonth = nn.Embedding(12, d)
+        self.t_cont = nn.Linear(N_TIME_CONT, d)
+        k = cfg.k_mix
+        if cfg.b2:
+            self.amt_head = mlp(3 * d, d, 3 * k)
+        else:
+            self.cp_ctx = mlp(3 * d, d, d)
+            self.gate = nn.Linear(d, 3)
+            self.ven_q = nn.Linear(d, d)
+            self.ven_out = nn.Embedding(V, d)
+            self.ven_bias = nn.Parameter(torch.zeros(V))
+            self.ptr_q = nn.Linear(d, DK)
+            self.ptr_k = nn.Linear(d, DK)
+            self.ptr_oov = nn.Parameter(torch.zeros(DK))
+            self.ptr_f = nn.Linear(d, N_PHI)
+            self.ent_feat = nn.Linear(N_PHI, d)
+            self.led = nn.Linear(2, d)
+            self.amt_head = mlp(4 * d, d, 3 * k)
+
+    # ---- encoder -------------------------------------------------------------------------------------------
+    def encode(self, B):
+        if self.cfg.enc == "marg":
+            hk = self.m_kind(B["role"][:, None] * 5 + B["tok_kind"])
+            ho = self.m_role(B["role"])[:, None].expand_as(hk)
+            return hk, ho
+        x = (self.e_kind(B["tok_kind"]) + self.e_cls(B["tok_cls"]) + self.e_venue(B["tok_venue"]) + self.e_tier(B["tok_tier"])
+             + self.e_dtbin(B["tok_dtbin"]) + self.e_month(B["tok_month"]) + self.tok_cont(B["tok_cont"]))
+        p = self.e_role(B["role"]) + self.e_cohort(B["cohort"]) + self.prof_mlp(torch.cat([B["prof"], B["ocont"]], -1))
+        x = torch.cat([p[:, None], x[:, 1:]], 1)
+        L = x.shape[1]
+        x = x + self.pos(torch.arange(L, device=x.device))[None]
+        if self.cfg.enc == "tf":
+            mask = nn.Transformer.generate_square_subsequent_mask(L, device=x.device)
+            h = self.ln(self.enc(x, mask=mask, is_causal=True))
+        else:
+            h = self.ln(self.enc(x)[0])
+        return h, h
+
+    # ---- heads ---------------------------------------------------------------------------------------------
+    def kind_time(self, hk, ho, t0):
+        """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ)."""
+        logpk = torch.log_softmax(self.kind_head(hk), -1)
+        n = hk.shape[0]
+        inp = torch.cat([ho[:, None].expand(n, 2, -1), self.e_tkind.weight[None].expand(n, 2, -1)], -1)
+        out = self.time_head(inp).reshape(2 * n, -1)
+        lp = torch.log_softmax(out[:, :64], -1)
+        lh = torch.log_softmax(out[:, 64:88], -1) if self.cfg.week else None
+        ld = torch.log_softmax(out[:, 88:95], -1) if self.cfg.week else None
+        law = TimeLaw(lp, lh, ld, t0.repeat_interleave(2))
+        return logpk, law, out
+
+    def time_emb(self, tbin, tmonth, tcont):
+        return self.e_tbin(tbin) + self.e_tmonth(tmonth) + self.t_cont(tcont)
+
+    def cp_context(self, B, rows_b, ho, ko, tt):
+        if self.cfg.enc == "marg":
+            return self.cp_ctx(torch.cat([self.m_role(B["role"][rows_b]), self.e_tkind(ko), torch.zeros_like(tt)], -1))
+        return self.cp_ctx(torch.cat([ho, self.e_tkind(ko), tt], -1))
+
+    def masks(self, B, ko):
+        """Valid REPEAT entries (No, P) and valid unseen venues (No, V) for the owned rows (e_* order), target kind ko."""
+        cnt = B["e_count"]
+        out_k = (ko == OUT)[:, None]
+        ent_ok = (cnt > 0) & (out_k | ((B["e_tier"] != 2) & B["e_sc"]))
+        ev = B["e_venue"]
+        seen = torch.zeros(len(ko), self.V + 1, dtype=torch.bool, device=cnt.device)
+        seen.scatter_(1, torch.where((cnt > 0) & (ev >= 0), ev, self.V), True)
+        ven_ok = ~seen[:, :self.V] & (out_k | self.venue_sc[None])
+        return ent_ok, ven_ok
+
+    def gate_logp(self, ctx, ent_ok, ven_ok):
+        g = self.gate(ctx)
+        neg = torch.full_like(g[:, 0], -1e9)
+        g = torch.stack([torch.where(ent_ok.any(-1), g[:, 0], neg), torch.where(ven_ok.any(-1), g[:, 1], neg), g[:, 2]], -1)
+        return torch.log_softmax(g, -1)
+
+    def pointer_logp(self, B, H, oi, rb, rj, ctx, t_tgt, ent_ok):
+        """Log-probs over partner entries for owned rows oi (indices into e_*; window rb, position rj), shape (n, P)."""
+        rec = t_tgt[:, None] - B["e_last"][oi]
+        ph = phi(B["e_count"][oi], rec, B["e_tin"][oi], B["e_tout"][oi], B["e_tier"][oi], B["e_wpos"][oi] >= 0)
+        if self.cfg.enc == "marg":
+            logits = torch.zeros(ph.shape[:2], device=ph.device)
+        else:
+            q = self.ptr_q(ctx)
+            kh = self.ptr_k(H)
+            Bn, L, _ = kh.shape
+            qf = torch.zeros(Bn, L, DK, device=q.device, dtype=q.dtype)
+            qf[rb, rj] = q
+            s = torch.bmm(qf, kh.transpose(1, 2))[rb, rj]  # (n, L)
+            wpos = B["e_wpos"][oi]
+            sh = s.gather(1, wpos.clamp(min=0))
+            soov = (q * self.ptr_oov).sum(-1, keepdim=True)
+            logits = torch.where(wpos >= 0, sh, soov) / math.sqrt(DK) + (self.ptr_f(ctx)[:, None] * ph).sum(-1)
+        logits = logits.masked_fill(~ent_ok, -1e9)
+        return torch.log_softmax(logits, -1), ph
+
+    def venue_logp(self, ctx, ven_ok):
+        v = self.ven_q(ctx) @ self.ven_out.weight.T + self.ven_bias
+        return torch.log_softmax(v.masked_fill(~ven_ok, -1e9), -1)
+
+    def amount_params(self, B, rows_b, ctx, cls, cpvec, led, ho=None, ko=None, tt=None):
+        if self.cfg.b2:
+            return self.amt_head(torch.cat([ho, self.e_tkind(ko), tt], -1))
+        if self.cfg.enc == "marg":
+            cpvec, led_e = torch.zeros_like(ctx), torch.zeros_like(ctx)
+        else:
+            led_e = self.led(led)
+        return self.amt_head(torch.cat([ctx, self.e_cls(cls), cpvec, led_e], -1))
+
+    # ---- likelihood ----------------------------------------------------------------------------------------
+    def terms(self, B, metrics=False) -> dict:
+        with torch.autocast("cuda", dtype=torch.float16, enabled=B["tok_kind"].is_cuda):
+            Hk, Ho = self.encode(B)
+        Hk, Ho = Hk.float(), Ho.float()
+        with torch.autocast("cuda", enabled=False):
+            return self._terms(B, Hk, Ho, metrics)
+
+    def _terms(self, B, Hk, Ho, metrics):
+        rb, rj, typ, t0, r = B["row_b"], B["row_j"], B["row_type"], B["row_t0"], B["row_r"]
+        N = len(rb)
+        hk, ho = Hk[rb, rj], Ho[rb, rj]
+        logpk, law, tout = self.kind_time(hk, ho, t0)
+        own = typ == 1
+        cen = (typ == 2) | (typ == 3)
+        tk = B["row_tkind"].clamp(min=0)
+        r2 = r.repeat_interleave(2)
+        logf = law.log_density(r2).view(N, 2)
+        logS = law.log_survival(r2).view(N, 2)
+        z = torch.zeros(N, device=rb.device, dtype=torch.float64)
+        res = {
+            "kind": torch.where(own, -logpk.gather(1, tk[:, None])[:, 0].double(), z),
+            "time": torch.where(own, -logf.gather(1, tk[:, None])[:, 0], z),
+            "cens": torch.where(cen, -torch.logsumexp(logpk.double() + logS, -1), z),
+            "own": own, "cen": cen,
+        }
+        oi = B["o_row"]
+        ko = tk[oi]
+        tt = self.time_emb(B["o_tbin"], B["o_tmonth"], B["o_tcont"])
+        cls = B["o_cls"]
+        amt = B["o_amt"]
+        k = self.cfg.k_mix
+        cp = torch.zeros(len(oi), device=rb.device)
+        if self.cfg.b2:
+            ap = self.amount_params(B, rb[oi], None, cls, None, None, ho[oi], ko, tt)
+            amt_ll = trunc_mog_logpdf(ap, amt, 1)
+            # independent cross-entropy training objective (uncensored prefixes only)
+            lt = tout.view(N, 2, -1)[oi, ko]
+            tbin, hour, dow = B["o_tbin"], B["o_thour"], B["o_tdow"]
+            res["b2_train"] = (F.cross_entropy(logpk[oi], ko, reduction="none") + F.cross_entropy(lt[:, :64], tbin, reduction="none")
+                               + F.cross_entropy(lt[:, 64:88], hour, reduction="none") + F.cross_entropy(lt[:, 88:95], dow, reduction="none")
+                               - gauss_logpdf(ap, amt))
+        else:
+            ctx = self.cp_context(B, rb[oi], ho[oi], ko, tt)
+            ent_ok, ven_ok = self.masks(B, ko)
+            lg = self.gate_logp(ctx, ent_ok, ven_ok)
+            cp = -lg.gather(1, cls[:, None])[:, 0]
+            cpvec = torch.zeros_like(ctx)
+            rep = cls == REPEAT
+            ven = cls == VENUE
+            hits = None
+            if rep.any():
+                ri = torch.nonzero(rep)[:, 0]
+                lptr, ph = self.pointer_logp(B, Ho, ri, rb[oi][ri], rj[oi][ri], ctx[ri], (t0 + r)[oi][ri], ent_ok[ri])
+                tgt = B["o_ent"][ri]
+                assert torch.all(ent_ok[ri].gather(1, tgt[:, None])), "REPEAT target masked"
+                cp = cp.index_add(0, ri, -lptr.gather(1, tgt[:, None])[:, 0])
+                cpvec = cpvec.index_copy(0, ri, self.ent_feat(ph[torch.arange(len(ri)), tgt]))
+                if metrics:
+                    # tie-aware expected Hits@k: a target tied with t others gets credit (k - better) / (t + 1)
+                    lt_ = lptr.gather(1, tgt[:, None])
+                    better = (lptr > lt_).sum(-1).double()
+                    ties = (lptr == lt_).sum(-1).double()
+                    hits = {kk: ((kk - better) / ties).clamp(0, 1) for kk in (1, 5)}
+            if ven.any():
+                vi = torch.nonzero(ven)[:, 0]
+                lv = self.venue_logp(ctx[vi], ven_ok[vi])
+                vt = B["o_venue"][vi]
+                assert torch.all(ven_ok[vi].gather(1, vt[:, None])), "VENUE target masked"
+                cp = cp.index_add(0, vi, -lv.gather(1, vt[:, None])[:, 0])
+                cpvec = cpvec.index_copy(0, vi, self.e_venue(vt))
+            ap = self.amount_params(B, rb[oi], ctx, cls, cpvec, B["o_led"])
+            amt_ll = trunc_mog_logpdf(ap, amt, k)
+        res["cp"] = cp
+        res["amt"] = -amt_ll
+        res["o_row"] = oi
+        if metrics:
+            res["kind_ok"] = (logpk.argmax(-1) == tk)[oi]
+            bp = law.bin_probs().view(N, 2, 64)[oi, ko]
+            res["bin_ok"] = bp.argmax(-1) == B["o_tbin"]
+            e = torch.as_tensor(EDGES, device=rb.device, dtype=torch.float64)
+            mids = torch.cat([torch.zeros(1, device=rb.device, dtype=torch.float64), torch.log1p(torch.sqrt(e[:-1] * e[1:]))])
+            pf = bp[:, :63]
+            res["logdt_err"] = ((pf * mids).sum(-1) / pf.sum(-1).clamp(min=1e-30) - torch.log1p(r[oi].double())).abs()
+            res["amt_err"] = (mog_mean(ap, k) - amt).abs()
+            if not self.cfg.b2:
+                res["cls_ok"] = lg.argmax(-1) == cls
+                res["rep_hits"] = hits
+                res["rep_mask"] = rep
+                res["amt_marg"] = -self.amount_marginal_ll(B, Ho, rb[oi], rj[oi], ctx, (t0 + r)[oi], ent_ok, ven_ok, lg, amt)
+        return res
+
+    @torch.no_grad()
+    def amount_marginal_ll(self, B, H, rb, rj, ctx, t_tgt, ent_ok, ven_ok, lg, amt, cand_budget=4_000_000):
+        """log p(amount | h, kind, time) = log Σ_cp p(cp | h, kind, time) p(amount | ..., cp), summed over every
+        candidate counterparty (each valid partner entry, each valid unseen venue, NEW). Used for the B2 comparison,
+        whose amount head never sees a counterparty. The amount head's first layer is linear in its concatenated
+        input, so per-candidate terms are added to a shared per-row part before the nonlinearity."""
+        k, d = self.cfg.k_mix, self.cfg.d
+        marg = self.cfg.enc == "marg"
+        lin1, act, lin2 = self.amt_head[0], self.amt_head[1], self.amt_head[2]
+        Wc, Wk, Wp, Wl = lin1.weight[:, :d], lin1.weight[:, d:2 * d], lin1.weight[:, 2 * d:3 * d], lin1.weight[:, 3 * d:]
+        base = ctx @ Wc.T + lin1.bias
+        if not marg:
+            base = base + self.led(B["o_led"]) @ Wl.T
+        kterm = self.e_cls.weight[:3] @ Wk.T  # (3, d): REPEAT, VENUE, NEW
+
+        def ll(pre, a):  # pre (n, c, d) → (n, c)
+            n, c, _ = pre.shape
+            prm = lin2(act(pre)).reshape(n * c, 3 * k)
+            return trunc_mog_logpdf(prm, a[:, None].expand(n, c).reshape(-1), k).view(n, c)
+
+        No = len(amt)
+        ll_new = ll((base + kterm[2])[:, None], amt)[:, 0]
+        lv = self.venue_logp(ctx, ven_ok)
+        vterm = torch.zeros(self.V, d, device=ctx.device) if marg else self.e_venue.weight[: self.V] @ Wp.T
+        ll_ven = torch.empty(No, device=ctx.device)
+        step = max(1, cand_budget // max(self.V, 1) // 4)
+        for i in range(0, No, step):
+            sl = slice(i, i + step)
+            ll_ven[sl] = torch.logsumexp(lv[sl] + ll((base[sl] + kterm[1])[:, None] + vterm[None], amt[sl]), -1)
+        ll_rep = torch.full((No,), -1e9, device=ctx.device)
+        P = ent_ok.shape[1]
+        if P > 0:
+            ri = torch.arange(No, device=ctx.device)
+            step = max(1, cand_budget // P // 4)
+            for i in range(0, No, step):
+                sl = ri[i:i + step]
+                lptr, ph = self.pointer_logp(B, H, sl, rb[sl], rj[sl], ctx[sl], t_tgt[sl], ent_ok[sl])
+                pterm = torch.zeros(len(sl), P, d, device=ctx.device) if marg else self.ent_feat(ph) @ Wp.T
+                ll_rep[sl] = torch.logsumexp(lptr + ll((base[sl] + kterm[0])[:, None] + pterm, amt[sl]), -1)
+        return torch.logsumexp(torch.stack([lg[:, 0] + ll_rep, lg[:, 1] + ll_ven, lg[:, 2] + ll_new], -1), -1)
+
+    def loss(self, B) -> tuple[torch.Tensor, dict]:
+        t = self.terms(B)
+        n = len(B["row_b"])
+        if self.cfg.b2:
+            return t["b2_train"].sum() / max(len(B["o_row"]), 1), t
+        tot = t["kind"].sum() + t["time"].sum() + t["cens"].sum() + t["cp"].sum() + t["amt"].sum()
+        return (tot / n).float(), t

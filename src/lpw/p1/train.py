@@ -1,0 +1,133 @@
+"""Train one Phase 1 model on a slice, early-stopping on validation NLL (SPEC §6.4).
+
+Usage: uv run python -m lpw.p1.train --pilot data/pilot --model lpw --out runs/p1/2021/lpw [--cutoff-months 2]
+"""
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from lpw.p1.batch import Views, collate_specs, pack, train_specs, val_specs
+from lpw.p1.model import CONFIGS, Model
+from lpw.p1.store import build_store
+
+
+class BatchDS(Dataset):
+    def __init__(self, views, batches):
+        self.views, self.batches = views, batches
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __getitem__(self, i):
+        return collate_specs(self.views, self.batches[i])
+
+
+def loader(views, batches, workers=4):
+    return DataLoader(BatchDS(views, batches), batch_size=None, shuffle=False, num_workers=workers, pin_memory=True,
+                      prefetch_factor=4 if workers else None)
+
+
+def to_dev(b, dev):
+    return {k: v.to(dev, non_blocking=True) for k, v in b.items()}
+
+
+@torch.no_grad()
+def val_loss(model, views, batches, dev) -> float:
+    model.eval()
+    tot, n = 0.0, 0
+    for b in loader(views, batches):
+        b = to_dev(b, dev)
+        loss, t = model.loss(b)
+        w = len(b["o_row"]) if model.cfg.b2 else len(b["row_b"])
+        tot += loss.item() * w
+        n += w
+    return tot / max(n, 1)
+
+
+def cutoff_ts(store, months: int) -> int:
+    from datetime import datetime, timezone
+    end = datetime.fromtimestamp(store.w_end, timezone.utc)
+    m = end.year * 12 + end.month - 1 - months
+    return int(datetime(m // 12, m % 12 + 1, 1, tzinfo=timezone.utc).timestamp())
+
+
+def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, patience=6, lr=1e-3, cutoff_months=0,
+          dev="cuda", log=print) -> dict:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+    store = build_store(pilot)
+    cutoff = None
+    if cutoff_months:
+        cutoff = cutoff_ts(store, cutoff_months)
+        store = build_store(pilot, cutoff=cutoff)
+    views = Views(store)
+    cfg = CONFIGS[model_name]
+    model = Model(cfg, store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scaler = torch.amp.GradScaler()
+    vb = pack(val_specs(store, store.agents("val")), views)
+    out.mkdir(parents=True, exist_ok=True)
+    best, best_ep, hist, step = float("inf"), -1, [], 0
+    warm = 300
+    for ep in range(epochs):
+        model.train()
+        t = time.time()
+        tb = pack(train_specs(store, store.agents("train"), rng), views, rng=rng)
+        tl, tn = 0.0, 0
+        for b in loader(views, tb):
+            b = to_dev(b, dev)
+            for g in opt.param_groups:
+                g["lr"] = lr * min(1.0, (step + 1) / warm)
+            loss, _ = model.loss(b)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            step += 1
+            tl += loss.item()
+            tn += 1
+        vl = val_loss(model, views, vb, dev)
+        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "sec": round(time.time() - t, 1), "steps": step})
+        log(f"[{model_name}] ep {ep} train {tl / max(tn, 1):.4f} val {vl:.4f} ({time.time() - t:.0f}s)")
+        if vl < best - 1e-4:
+            best, best_ep = vl, ep
+            torch.save(model.state_dict(), out / "model.pt")
+        elif ep - best_ep >= patience:
+            break
+    info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep,
+            "cutoff": cutoff, "params": sum(p.numel() for p in model.parameters()), "history": hist}
+    (out / "train.json").write_text(json.dumps(info, indent=1))
+    return info
+
+
+def load(pilot: Path, model_name: str, out: Path, store=None, dev="cuda"):
+    store = store or build_store(pilot)
+    model = Model(CONFIGS[model_name], store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
+    model.load_state_dict(torch.load(out / "model.pt", map_location=dev))
+    model.eval()
+    return model
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pilot", default="data/pilot")
+    ap.add_argument("--model", default="lpw", choices=list(CONFIGS))
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--cutoff-months", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=20261104)
+    a = ap.parse_args()
+    train(Path(a.pilot), a.model, Path(a.out), seed=a.seed, epochs=a.epochs, cutoff_months=a.cutoff_months)
+
+
+if __name__ == "__main__":
+    main()
