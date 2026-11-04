@@ -1,0 +1,529 @@
+# SPEC: Learned-Policy World (LPW)
+
+From next-event prediction to an agent-based synthetic AML simulator.
+
+- **Status:** draft for review, 2026-11-04. No code exists yet.
+- **Inputs:** the paper digests in [papers/](papers/README.md) and the HuggingFace dataset `fesevu/ethereum_fraud_dataset_by_activity`.
+- **Hardware for the pilot:** GTX 1650 Super (4 GB VRAM, Turing sm_75, no tensor cores), 15 GB RAM, 12 CPU threads.
+
+## 0. TL;DR
+
+A next-event model `p_θ(e_{k+1} | history_k, profile, role)` (Banksformer-style) is already an agent *policy*. It only generates one account in isolation. LPW turns it into an agent-based simulator by adding five things:
+
+1. **Who.** Each event picks a counterparty: a past partner, a public venue, a group-shared address, another simulated agent, or a fresh address. All of these choices are learned.
+2. **When, coupled.** A shared world clock. An agent re-draws its next action whenever its history changes, including when another agent sends it money.
+3. **How much is possible.** A per-agent ledger that the amount head conditions on.
+4. **Who exists.** A learned prior over agent roles, activation times, profiles and (later) latent behaviour types and groups.
+5. **What would have been recorded.** An *observation operator* that applies the dataset's own recording rules to the synthetic world (dust floor, seed-incident edges only). Only then is the result compared with the matching real data.
+
+Illicit behaviour is **not injected from templates or edited into the graph**. Illicit agents run the same learned policy, conditioned on a role learned from real labeled scam addresses. The output is checked against **real labels** (train on synthetic, test on real: TSTR), not only against stylized facts.
+
+## 1. Goal and non-goals
+
+**Goal.** Build a generator of synthetic AML-style datasets. Each dataset has:
+- a node table (agents with observable profiles),
+- a transaction table,
+- node-level and transaction-level labels,
+- a hidden-state log, as in FINESSE `L_hidden`.
+
+The behaviour in it is learned from data, not hand-programmed. Start small (local pilot), then scale.
+
+**Non-goals for v1:**
+- ERC-20, internal or zero-value transactions. They are not in the edge data (§5.1).
+- Smart contracts as actors. Contracts never send in this data, so they are only passive counterparties.
+- Second-hop (layering) flows beyond agents' own transactions. The released E2 edges cannot identify them (§5.2).
+- Gas/fee modelling. Fees are still read, for the ledger.
+- Multi-currency and payment formats (AMLworld/TransXion).
+- Formal causal inference. FINESSE disclaims it too.
+- Adversarial hardening of illicit agents. It is future work (§10).
+
+**Framing caveat.** The real labels are *scam/phishing addresses*: fraud, not adjudicated laundering. LPW's "illicit" means "controlled by, or carrying funds from, a scam-labelled actor". Moving scam proceeds is a laundering-adjacent behaviour, but the outputs must be called "illicit-linked", not "laundering", unless better labels are added.
+
+## 2. What "fixing the criticisms" means
+
+Two sets of criticisms are in scope: the ones TransXion raises about existing AML benchmarks (C1, C2), and the weaknesses of TransXion itself (T1–T5). Each row names the test that checks the fix (§7).
+
+| ID | Criticism | Source | LPW fix | Test |
+|---|---|---|---|---|
+| C1 | Edge-only logs, no node semantics, so "out-of-character" behaviour cannot be modelled | TransXion §1 on AMLSim, AMLworld, SAML-D | Every agent has an observable profile that conditions its policy. A node table and a hidden-state log are emitted. "Out-of-character" has a direct meaning: low likelihood under the agent's own policy. | Profile-gain parity (§7.4) |
+| C2 | Template injection (fan-in, fan-out, smurfing...) teaches detectors shortcuts | TransXion §1 | No templates. Illicit behaviour comes from the learned policy. Coordination comes from learned group structure (§6.6). | Shortcut audit, mode coverage, TSTR (§7.4) |
+| T1 | TransXion's normal backbone is hand-coded. Its counterparty mixture (locality, decayed memory, attractiveness, exploration) has no published formula or weights. | TransXion §3.1 | The same four ideas become *learned* counterparty classes: REPEAT (memory), VENUE (attractiveness), GROUP/AGENT (locality), NEW (exploration). The gate and the choices are fitted by maximum likelihood. | P1 next-event metrics (§7.1) |
+| T2 | Anomalies (LLM edits of real subgraphs) and backbone (ABM) come from different generators, so detectors may learn which generator made the data | TransXion §3.2–3.3 | Normal and illicit agents come from one model and one engine. | Seam test (§7.4) |
+| T3 | Hardness is optimized against a monitor with only validity constraints, so hardness is not the same as realism | TransXion App. A | The target is *difficulty parity with real data* at matched prevalence. Hardening is not part of v1 (§10). | Difficulty parity (§7.4) |
+| T4 | Validation uses stylized facts and detector scores only. Nothing is tested against real labeled outcomes. | TransXion §5 | Real labels exist here, so TSTR on held-out real addresses is the headline test. | §7.4 |
+| T5 | Labels are transaction-level only. There are no typology IDs and no hidden state. | TransXion App. B.1 | LPW emits node roles, group IDs, latent behaviour types (Phase 2), taint fractions and a daily hidden-state log. | Output schema (§6.9) |
+
+## 3. Core idea
+
+```
+   learned population prior  p(group) · per member: p(role) p(cohort, activation | role) p(z | ·) p(profile | z, ·)
+                              │
+                              ▼
+ ┌──────────── agent i: policy p_θ(next owned event | own stream, partner table, profile, role, z) ────┐
+ │  kind ─► time (normalized Δt × hour × weekday law) ─► counterparty class+choice ─► amount           │
+ └──────────────┬───────────────────────────────────────────────────────────────────────────────────────┘
+                │ OUT to agent j   → j's stream gets an IN_agent token → j re-draws its clock
+                │ OUT to non-agent → venue / group-shared / new periphery node (passive in v1)
+                │ IN_exo           → generated by i's own policy (sender not simulated)
+                ▼
+     world engine: exact event-ordered clock, ledgers, fund inventories, groups, taint ──► full world log
+                                                                         │
+                       observation operator O (dust floor, agent-incident edges)
+                                                                         ▼
+                 synthetic dataset, compared like-for-like with the real reference R_W (§6.8)
+```
+
+**Ownership rule (§6.7).** Every event has exactly one generator. No other engine component generates inflows to agents.
+- An OUT event belongs to its sender's policy.
+- An IN event from a non-simulated source (`IN_exo`) belongs to the receiver's policy.
+- An IN event from a simulated agent (`IN_agent`) is the sender's OUT. The receiver only *observes* it.
+
+## 4. What each paper contributes
+
+| Paper | Reused | Adapted or rejected |
+|---|---|---|
+| Banksformer | Decoder-only transformer with a metadata token at position 0 and per-field conditional generation inside each event (teacher forcing). The **date mechanism**: per-component date heads combined as a product renormalized over a candidate window. Metric suite (W1, JSD, 3-gram JSD, joint type×date JSD). Ablation pattern (BF-ND, BF-NC). | Calendar dates become continuous time with log-spaced Δt bins plus hour-of-day and day-of-week (§6.3). Fixed-length sequences become right-censored streams. Censoring needs a single time law, so the heads are trained *jointly* through the normalized product. Banksformer's independent head training stays in baseline B2. |
+| BankGAN | Keep the discrete skeleton (kind, time, counterparty) separate from attribute generation. **Clock (sin/cos) encoding** for cyclic inputs (best overall in its Table 1). Multimodal amount modelling (BankGAN had the best Amount W1 of the three models, which its authors credit to GMM mode-specific normalization). | The CTGAN attribute generator becomes a mixture-density head, which is stable on a 4 GB GPU. A CTGAN head is an optional ablation (A4). DP-SGD is not needed because the chain is public. A memorization check is kept instead (§7.4). |
+| FINESSE | Agents with latent behaviour policies that drive observed streams. A **hidden-state log** emitted as ground truth. Venues as "merchants" with popularity and affinity. The next-event TPP benchmark framing (type error, time error). | Hand-specified policy families (its Table 2) become learned latent types (Phase 2). The bank-intervention stream is future work (§10). |
+| TransXion | Profile-conditioned agents, the counterparty mixture *concept*, labels propagated along fund traces, and its evaluation suite: RQ1 stylized facts, Clauset tails, AP/F1 over AUC. | Every hand-coded mechanism becomes learned (T1). Post-hoc subgraph embedding is dropped, because there is a single generator (T2). GRPO hardening with cross-family transfer is future work. If it is done, it acts on the small policy's own actions, so no LLM is needed (§10). |
+
+## 5. Data
+
+### 5.1 Verified facts (checked 2026-11-04)
+
+Sources: the HF API file listing, the dataset READMEs, the pipeline code at `github.com/fesevu/eth-fraud-dataset-pipeline` (`bq/GNN/GNN`, `dataset/final/LSTM/build_unified_dataset.py`), and local polars scans of the label files, `month_targets.parquet`, `lstm_dataset/monthly.parquet` and the monthly edge files for 2017-06 and 2021-10. Phase 0 re-checks every number.
+
+**Size and coverage**
+- 121 monthly edge files, 2015-08 to 2025-08 (2025-08 is partial and ends at ts 1755475139). 380,566,661 edges in total.
+- About 21.3 GB in `gnn_dataset/edges_by_month/`. The whole repo is about 73 GB, including raw exports.
+- **Edge schema:** `src_id, dst_id` (UInt64 hashes of addresses), `ts` (s, UTC), `value_wei`, `tx_fee_wei` (decimal strings), `block_number`, `contract_creation`, `tx_hash`.
+
+**How edges were sampled (pipeline SQL)**
+- **Seeds** are labeled addresses with non-null `activity_start_ts`.
+- **E1** is *every* top-level native-ETH transaction of a seed inside its activity window with `value ≥ 1e14 wei` (0.0001 ETH). So seeds have complete native-ETH histories above the dust threshold.
+- **E2** consists of same-UTC-day transactions *between* first-hop (L1) and second-hop (L2) neighbours. The selection runs as follows:
+  - **S2:** keep the top 15 L1 neighbours per (seed, day). They are ranked by summed value over *all* the seed's transactions, including those below the dust floor, so the ranking happens before the dust filter.
+  - **S3:** keep the top 5 L2 neighbours per (seed, day) *within each of 16 L1-hash-shard batches*. That allows up to 80 L2 per (seed, day).
+  - **S6:** keep transactions in both directions (L1→L2 and L2→L1) at or above the dust floor, capped at 20 per (seed, day, from, to) *directed* pair.
+- The data has no ERC-20 transfers, no internal transactions and no zero-value calls. **Contracts never appear as senders** (the out-fraction of contract seeds is 0.0 in 2021-10).
+
+**Labels**
+- `targets_global.parquet` has 114,739 addresses:
+
+  | | EOAs | Contracts | Total |
+  |---|---|---|---|
+  | scam | 14,982 | 39,671 | 54,653 |
+  | non-scam | 30,059 | 30,027 | 60,086 |
+
+- Descriptions are mostly `phishing`/`Phishing` (42,853), then `Scamming` (2,176), `ponzi` (374) and `rugpull` (266). The labels are node-level only.
+- 29,592 labeled addresses (24,776 of them scam) have a null `activity_start_ts`, so they have no edges.
+- 66,002 seeds are active in at least one month:
+
+  | | EOAs | Contracts |
+  |---|---|---|
+  | non-scam | 29,643 | 14,005 |
+  | scam | 12,389 | 9,965 |
+
+**Severe label/time confound**
+- Non-scam EOAs were mostly *born* in 2017–2018. Only **130** non-scam EOAs were born between 2020-07 and 2022-12, against 5,835 scam EOAs.
+- Activity overlaps better. In every month from 2021-05 to 2022-04, `month_targets` lists 689–1,494 active non-scam seeds and 989–2,601 active scam seeds (all address types, hubs included).
+- Among non-hub EOAs active in 2021-10, account age alone separates the classes with **AUC 0.93**. Median age is 1,386 days for non-scam and 146 days for scam.
+
+**2021-10 profile (9,678,589 edges)**
+- **Edge mix:** 98.5% touch a seed. 0.84% are seed↔seed. 1.5% are E2.
+- **Hubs:** 67 seeds with more than 2,000 events/month (47 non-scam EOAs, 19 non-scam contracts, 1 scam contract) hold **99.3% of seed-events**.
+- **Non-hub EOAs:**
+
+  | Median per agent | non-scam (700 agents, 18,017 events) | scam (2,068 agents, 40,046 events) |
+  |---|---|---|
+  | events | 2 | 7 |
+  | out-fraction | 0.61 | 0.67 |
+  | repeat-counterparty rate | 0.00 | 0.33 |
+  | counterparties shared with ≥5 seeds | 0.40 | 0.68 |
+
+- Agent↔agent events are **about 1.0%** of all events.
+- **Per-agent hour-of-day entropy** (agents with ≥10 events) has a median of about 3.1–3.2 bits, against a 4.58-bit maximum. The aggregate UTC profile is nearly flat (±15%), so diurnal structure is per-agent, not global.
+
+**Pilot-window cohort** (`month_targets`, EOAs active anywhere in `W` = 2021-05 to 2022-04, before hub exclusion)
+
+| | Active in W | Born before W | Born inside W (`activity_start_ts` in W) |
+|---|---|---|---|
+| non-scam | 2,941 | 2,875 | 66 |
+| scam | 4,338 | 1,476 | 2,862 |
+
+**Pre-window profile sources**
+- `lstm_dataset/monthly.parquet` has monthly features for 85,147 labeled node_ids, 2015-08 to 2025-08. It includes ERC-20 counts, internal-transaction values, peer counts and fees.
+- But `monthly` is built **from ISO weeks**, and ISO weeks cross month boundaries. For example, April includes May 1–2. So monthly rows leak activity from after a month-start cutoff, and cumulative sums count boundary weeks twice.
+- Profiles therefore come from the **daily** records instead (`lstm_dataset/daily_filtered.parquet`, or the raw `LSTM/parquet/daily_final_*`), aggregated strictly before the cutoff (§5.3).
+
+### 5.2 Consequences for the design
+
+1. **Only seeds are full agents.** Their neighbours are partial and biased samples. Population tiers (§6.1):
+   - agents are non-hub EOA seeds;
+   - venues are hub seeds plus widely shared counterparties;
+   - periphery is everything else.
+2. **Coupling is mostly indirect.** Agents rarely transact directly (about 1%). They mostly connect through shared counterparties: venues and group-shared addresses, especially among scam agents (0.68 vs 0.40). Groups (§6.6) are therefore the main coupling mechanism. Direct agent↔agent edges are second.
+3. **Only complete data is compared.** An agent's E1 edges are complete above the dust floor, so v1 models and compares only agent-incident E1 edges (§6.8). E2 is excluded from v1 for two reasons:
+   - It is not a record of forwarding episodes. It has reverse-direction transactions and transactions before the triggering transfer, and an edge missing from E2 does not mean "did not forward".
+   - The released edges carry no seed provenance, and the frontier selection (ranked before the dust filter, shard-batched) cannot be replayed for a reduced seed set.
+4. **Activity-window design with two cohorts.** Normal agents are mostly old accounts. They enter the window with pre-window profiles (left-censoring). Most scam agents (2,862 of 4,338) are *born inside* the window. Both cohorts are modelled (§5.3, §6.7), and every stream is right-censored at the end of observation.
+5. **The confound is reproduced, then controlled for.** The generator conditions on account age and cohort, so it reproduces the real (age, role) joint. Utility claims use matched evaluation on common support (§7.5). Simulating young normal accounts is out of distribution in the pilot (risk R1).
+6. **The output is a native-ETH view.** Phishing approval drains (ERC-20) are invisible in it.
+
+### 5.3 Pilot slice
+
+**Window.** `W = [2021-05-01, 2022-05-01)` UTC, 12 months. The 12 monthly files hold 101.5M edges (about 6 GB) to download.
+
+**Preprocessing order.** It runs one way and is frozen afterwards:
+1. **Label-blind structural preprocessing**, on all W data. Labels are not used.
+   - *Hubs:* EOA seeds with more than 2,000 E1 events in any calendar month of W. They become venues. Phase 0 reports their label mix.
+   - *Agents:* the remaining EOA seeds with at least 1 E1 event in W.
+   - *Venues:* hubs, plus counterparties touched by at least `S_pub` distinct agents. `S_pub` is chosen from the label-blind distribution of distinct-agent degree (default 50). At most 1,024 venues, ranked by distinct agents. This step sees test agents' structure (transductive) but never their labels.
+   - *Groups:* connected components of the agent–counterparty bipartite graph after removing the venues.
+2. **Split by group** (scam clusters share counterparties, so a split by agent would leak). 70/15/15, stratified by role. Labels are used here only to stratify.
+3. **Train-only fitting.** Everything that uses labels or is learned is fitted on the train split only: models, quantile bins, the group prior, activation rates, the ledger tolerance and the detectors. Thresholds and model selection use the validation split (§7).
+
+A secondary temporal check holds out the last 2 months of W, for the next-event metrics only.
+
+**Inputs per agent**
+- *Events:* the agent's E1 events in W, as one merged IN/OUT stream.
+- *Cohort:*
+  - **pre-existing:** `activity_start_ts` < W start;
+  - **born in W:** `activity_start_ts` in W. The stream starts at that activation time.
+- *Profile (pre-existing cohort only).* Aggregated from daily records strictly before W start (§5.1). Fields:
+  - account age at W start;
+  - days active;
+  - lifetime counts and volumes;
+  - peers;
+  - ERC-20 activity;
+  - an initial balance proxy: the cumulative `eth_recv_sum + internal_in_value_eth_sum − eth_sent_sum − internal_out_value_eth_sum − tx_fee_eth_sum`.
+
+  The born-in-W cohort has an empty profile: age 0, no prior activity, balance 0. Phase 0 checks the sign of the balance proxy, its consistency with edge sums, and the coverage of the daily files.
+- *Observation end:* W end. For an agent whose `activity_end_ts` falls inside W, it is instead the data end (2025-08-18), because the data show no activity after that date. Phase 0 checks `activity_end_ts` against the last edge.
+
+**Expected scale.** At most 2,941 normal and 4,338 scam agents (the W cohort before hub exclusion), and about 0.5–1M event tokens. 2021-10 alone had 58k non-hub EOA events. Phase 0 measures the real numbers.
+
+## 6. Design
+
+### 6.1 Entities
+
+| Tier | Real-data source | In the simulator |
+|---|---|---|
+| Agent | Non-hub EOA seeds | Runs the policy. Has a ledger, a fund inventory, a partner table, a profile, a role, a cohort, a group and (Phase 2) latent type `z`. |
+| Venue | Hub seeds and public shared counterparties | Persistent pool with learned embeddings (popularity and role-specific affinity, like FINESSE merchants). Not simulated as a sequence. Released under synthetic IDs, with `node_type` (EOA, contract, unknown; from labels where known) and a `sender_capable` flag (appeared as a sender in the real data). |
+| Group-shared node | A non-venue, non-agent counterparty touched by ≥2 agents of one group | Created fresh per synthetic group (Phase 3). Never shared across groups, so no global blacklist shortcut appears. Has a fund inventory, for taint. |
+| Periphery | Every other counterparty | Created by NEW draws. Passive in v1: it receives OUTs and is the source of `IN_exo` events. |
+
+### 6.2 Event token
+
+Each agent stream is `[PROFILE] e_1 e_2 …`. Events are sorted by `(ts, block_number, tx_hash)`, so order within a second is deterministic.
+
+The fields of an event `e_k`:
+- `kind ∈ {OUT, IN_exo, IN_agent}`.
+- `ts` encoded as:
+  - `log1p Δt` since the previous token,
+  - hour-of-day and day-of-week as clock encodings (sin/cos),
+  - window-relative month, as an era/macro covariate.
+- `cp_class ∈ {REPEAT, VENUE, GROUP, AGENT, NEW}`. Phase 1 uses only `{REPEAT, VENUE, NEW}`. GROUP and AGENT events fall back to NEW or REPEAT depending on the agent's own history. The precedence is REPEAT > AGENT > GROUP > VENUE > NEW, judged at event time:
+  - REPEAT: the agent touched this counterparty before. It resolves to the actual node, which may be an agent.
+  - AGENT: the counterparty is another simulated agent.
+  - GROUP: a non-agent, non-venue node that another member of the agent's group touched before `ts`. Group pools never contain agents or venues.
+- `cp_ref`:
+  - REPEAT: the entry in the agent's partner table (§6.3).
+  - VENUE: the venue id.
+  - AGENT: an inductive descriptor of the other agent.
+- `amount = log10(ETH)`, which is at least −4 because of the dust floor.
+- `ledger` before the event: `log1p |b|` and `sign(b)`. Observed balances can go negative because some flows are unobserved.
+
+The PROFILE token holds:
+- the role embedding;
+- the cohort, with activation time for the born-in-W cohort;
+- the profile fields;
+- (Phase 2) `z`.
+
+### 6.3 Policy model
+
+**Architecture.** A Banksformer-style decoder: 4 layers, `d_model = 128`, 4 heads, about 1M parameters. The context is the PROFILE token *always prepended*, plus the most recent 255 event tokens. The same context is used in training and simulation. It runs in fp16 with AMP (TU116 has 2× fp16 rate, no tensor cores).
+
+**Factorization.** It follows Banksformer's conditional field order. Each head sees the context vector plus the fields already generated, with teacher forcing during training:
+
+```
+p(next owned event | h_k) = p(kind | h) · p(time | h, kind) · p(cp | h, kind, time) · p(amount | h, kind, time, cp)
+```
+
+**Kind head.** Softmax over `{OUT, IN_exo}`. `IN_agent` is never a target (§6.4).
+
+**Time law** (the Banksformer date mechanism, adapted as one normalized law). It is used identically for training, censoring and sampling.
+- *Heads,* conditioned on the kind:
+  - `p_Δ` over 64 bins: bin 0 is "same second", bins 1–62 are log-spaced over [1 s, 365 d), and bin 63 is "≥ 365 d (dormant)";
+  - `p_hour` (24 classes, UTC);
+  - `p_dow` (7 classes).
+- *Weekly weight.* `w(c) = p_hour(h(c)) · p_dow(d(c))` for each of the 168 hour cells `c` of the week, normalized so its weekly mean is 1.
+- *Density.* For absolute time `t` after the last token time `t_k`:
+  - **finite bins 1–62:** the density in seconds is `f(t | κ) = p_Δ(b) / |b| · w(c(t)) / Z`, where `b` is the bin containing `t − t_k` and `|b|` its width in seconds;
+  - **bin 0:** an atom at `t_k` with mass `p_Δ(0) · w(c(t_k)) / Z`;
+  - **bin 63:** an atom ("dormant") with mass `p_Δ(63) / Z`.
+- *Normalizer.* `Z = p_Δ(0) w(c(t_k)) + Σ_{b=1..62} p_Δ(b) · c̄_b + p_Δ(63)`. Here `c̄_b` is the exact mean of the piecewise-constant `w` over `[t_k + lo_b, t_k + hi_b)`, computed in closed form from 168-cell prefix sums.
+- *Owned-event law.* `p(κ, t | h) = p(κ | h) · f(t | κ)`. Its survival function is `S(r) = Σ_κ p(κ | h) · ∫_{t_k + r}^∞ f(t | κ) dt`, with the dormant atom included.
+- *Exact sampling.*
+  1. Sample κ.
+  2. Sample a bin with probability proportional to its mass (`p_Δ(b) · c̄_b` for finite bins).
+  3. Inside a finite bin, sample an hour cell in proportion to `w` times the cell's overlap with the bin.
+  4. Sample a time uniformly in seconds inside that overlap.
+- *Ablations.* A1 sets `w ≡ 1` (Δt only; the BF-ND analogue). Baseline B2 keeps Banksformer's original recipe (§7.1).
+
+**Counterparty head**
+- A gate over the counterparty classes.
+- **REPEAT:** a pointer softmax over the agent's **partner table**, which lives outside the transformer window. The table holds every distinct past counterparty of the agent, with no cap. Hubs are excluded as agents, so tables stay small. Each entry carries:
+  - log interaction count, time since the last interaction, log total in and out, and the node tier;
+  - the hidden state of the counterparty's latest occurrence if it is inside the context, or else a learned "out-of-context" vector plus a flag.
+
+  This is the learned, time-decayed memory. A revisit is never silently turned into NEW.
+- **VENUE:** a softmax over venue embeddings.
+- **NEW:** a fresh periphery id.
+- **Phase 3 adds GROUP and AGENT.**
+  - GROUP is a pointer over the group pool, which grows with NEW draws inside the group.
+  - AGENT is a sampled softmax over currently alive agents, using inductive descriptors `φ_j`: observable state such as activity, age, balance bucket and group-membership flag. Never per-ID embeddings, so it works for synthetic populations. Training uses 63 negatives drawn from agents active in the same ISO week.
+- **Masks for `IN_exo`:** the AGENT class, REPEAT entries that are agents, and every node that is not `sender_capable` (contract venues and contract-typed nodes). Agent-to-agent INs are owned by the sender, and contracts never send in this data.
+
+**Amount head.** A mixture of 8 Gaussians on `log10 ETH`, conditioned on the fields above and on the ledger features. This is the BankGAN multimodality lesson. Samples below −4 are rejected and redrawn, to match the dust floor; the likelihood is renormalized above −4 to match.
+- Ablation A3: a single Gaussian (the Banksformer default).
+- Ablation A4 (optional): a CTGAN-style attribute head conditioned on the hidden state (BankGAN).
+
+**Profile generator.** Synthetic agents need profiles. A small autoregressive model over quantile-binned profile fields learns `p(profile | role, cohort)`, and `p(profile | z, role, cohort)` from Phase 2. Profiles are not bootstrapped from real rows. The born-in-W cohort has an empty profile and needs no model.
+
+### 6.4 Training
+
+**Targets per prefix (competing risks).** Every prefix `k` (from PROFILE to the last token) gets exactly one time term. The origin is `t_k`, the time of the prefix's last token (or the activation time, for PROFILE).
+
+| Next token after prefix `k` | Time term | Other terms |
+|---|---|---|
+| Owned (OUT or `IN_exo`) | `−log p(κ, t | h_k)` | Counterparty and amount NLL at this same prefix. Any `IN_agent` the event depends on, and its sender, are already inside the prefix. |
+| `IN_agent` | Censored: `−log S(t_{k+1} − t_k)` | None |
+| None (last token) | Censored at the observation end (§5.3): `−log S(T_obs − t_k)` | None |
+
+For ended streams, the censoring time is more than 365 days, so the term equals the dormant atom's probability. A standalone Phase 1 generator never produces `IN_agent` tokens. They are about 1% of real events, so the P1 fidelity metrics compare against real streams with `IN_agent` removed.
+
+- **Loss:** the sum of the terms above. The field weights start at 1 and are tuned on validation NLL only.
+- **Long streams:** random windows of PROFILE plus 255 event tokens. The partner table and ledger carry state from before the window.
+- **Optimizer:** AdamW with early stopping on validation NLL. Seeds are fixed.
+
+### 6.5 Latent behaviour types (Phase 2)
+
+1. Train a CoLES-style contrastive GRU encoder on train-split agent sequences (positives are sub-sequences of the same agent).
+2. Fit a GMM on the embeddings. Choose K ≤ 32 by BIC.
+3. Use the cluster as `z`. Condition the policy on `z` through the PROFILE token. The prior becomes `p(z | role, cohort) p(profile | z, role, cohort)`.
+4. **Inference.** The training assignment of `z` uses the whole sequence, so it must never condition a held-out prediction.
+   - Next-event metrics on held-out agents *marginalize* `z` over the prefix posterior `p(z | role, cohort, profile, observed prefix)`. It is proportional to the prior `p(z | role, cohort, profile)` times the policy's own likelihood of the prefix under each `z`, and it never uses future tokens. One pass over the sequence for each of the ≤ 32 values of `z` gives the posterior at every prefix, from cumulative per-token log-likelihoods.
+   - Generation samples `z` from the prior.
+   - Conditioning on the full-sequence `z` is reported only as a labelled oracle diagnostic.
+5. Log `z` in the hidden-state log. It is LPW's typology ID (T5).
+6. **Keep `z` only if it helps** (exit criteria, §8).
+
+v1 has no latent drift. FINESSE-style switching is listed under §10.
+
+### 6.6 Groups and shared counterparties (Phase 3)
+
+- Real groups (§5.3) give a learned group prior: the empirical joint over group size and role mix in the train split.
+- Each synthetic group gets an empty pool of group-shared nodes:
+  - a member's NEW draw adds to its group's pool;
+  - a member's GROUP draw picks from that pool.
+- This reproduces *structure*: shared sinks and funders inside a cluster, plus cluster sizes. It does not create global identifiers that a detector could memorize.
+- Without this, Phase 1 synthetic agents never share counterparties, and the graph metrics will show it. That is the reason for the phase.
+
+### 6.7 World engine
+
+**Population.** The configuration sets the number of agents N, the illicit prevalence π (independent of the balanced training set) and the horizon (W by default). Sampling order:
+1. **Groups** (Phase 3) are drawn from the group prior, reweighted to hit π. Before Phase 3 every agent is its own group and roles are Bernoulli(π).
+2. **Per member, in this order:** role from the group's role mix; then cohort and activation time from `p(cohort | role)`, using weekly activation rates per role from the train split (a scenario input, like TransXion's daily controller); then `z ~ p(z | role, cohort)` (Phase 2); then `profile ~ p(profile | z, role, cohort)`.
+
+Pre-existing agents start at t0 with their profile balances. Born-in-W agents enter at their activation times.
+
+**Clock (competing clocks).** Each agent keeps one pending "next owned event" time, drawn from the time law on its current prefix.
+- Whenever a token is appended to an agent's stream, its pending time is discarded and redrawn from the new prefix. The token can be its own event, or an `IN_agent` delivered by another agent.
+- The new prefix's origin is that token's timestamp. No truncation is needed.
+- This matches training exactly (§6.4). A prefix followed by an `IN_agent` is censored at the delivery, and the next prefix's time is measured from the delivery.
+
+**Exact sequential execution.** Agents couple through deliveries, group pools and the AGENT candidate descriptors `φ_j`, so commits must happen strictly in global time order.
+1. Each agent holds its pending `(κ, t)` and the cached hidden state `h` of its current prefix. They sit in a priority queue keyed by `(t, agent id)`.
+2. **Pop and commit.** Pop the earliest agent `A`. Evaluate its counterparty and amount heads from the cached `h`, with the candidate sets as they are at `t` (the group pool, alive agents, `φ_j`). This is valid because `A`'s own prefix has not changed since `h` was computed; if it had, `A` would have been redrawn. Commit the event: append it to `A`'s stream and update ledgers, inventories, partner tables and pools.
+3. **Deliver.** If the event is an OUT to agent `R`, append an `IN_agent` token to `R`'s stream at `t`. Every earlier commit is at or before `t`, so streams stay time-ordered.
+4. **Redraw immediately.** Run one transformer pass on the new prefix of `A`, and of `R` if there was a delivery. Push their new pending times. This happens *before* anything later is committed, so a redraw can never land before an event that is already committed.
+
+**Invariant:** no context ever contains a token later than the action being generated, and commits are in global time order. The engine asserts both.
+
+**Cost.** About one transformer pass per committed event (the actor's redraw), plus about 1% more for receivers. The pass covers PROFILE plus 255 tokens. A per-agent KV cache (in CPU RAM, about 0.5 MB per agent, about 3.5 GB for 7k agents) may be used only while an agent's stream is shorter than the window (at most 255 events). Once the window starts to slide, cached higher-layer states still encode evicted events, so every later pass for that agent is a full recomputation over PROFILE plus the current 255 events.
+
+**Ledger** (the observed-balance feature): `b ← b + in − out − fee`.
+- Fees are sampled from the empirical fee distribution for the same calendar day of the real window. This is an environment input, not a behaviour.
+- Phase 1 and 2: the ledger is an input feature only.
+- Phase 3: an OUT larger than `b + tolerance` is redrawn. `tolerance` is calibrated on the train split so that the synthetic rate of negative-balance events matches the real rate measured in Phase 0. Real observed balances go negative because of unobserved flows, so a hard zero floor would be unrealistic.
+
+**Fund inventory** (for labels only; separate from `b`). Every engine-tracked node (agents and group-shared nodes) holds a non-negative clean part `c` and tainted part `x`.
+- *Start:* pre-existing agents have `c = max(b0, 0)`, `x = 0`. Born-in-W agents and new group nodes start at 0.
+- *Inflow* of amount `a` with taint `τ`: `x += τa`, `c += (1 − τ)a`. Untracked sources (venues, periphery) send with `τ = 0`.
+- *Outflow* (including fees): if `a > c + x`, the shortfall is first added to `c`, as funding from an unknown, untainted source. Then the outflow takes the haircut share `τ_out = x / (c + x)` and is removed proportionally.
+- *Source rule:* every OUT from an illicit agent has `τ = 1`.
+
+### 6.8 Observation operator O and real reference R_W
+
+- **O** applies the pipeline's recording rules that bear on agent-incident edges: the dust floor (`value ≥ 1e14 wei`) and the seed-incident rule, under which every edge with an agent endpoint is recorded.
+- **R_W** is every real E1 edge in W with at least one non-hub agent endpoint. It is complete above the dust floor by construction (§5.1), so `O(world)` and `R_W` are like-for-like. Hub-only and E2 edges are excluded from both.
+- Every real-vs-synthetic structural comparison uses `O(world)` against `R_W`, with the number of active agents matched per day.
+
+### 6.9 Labels and outputs
+
+- **`nodes`:** synthetic address id, tier, `node_type` (EOA for agents, otherwise as in §6.1), the observable profile fields, cohort, the role label and the group id. The released version separates the observable columns from the hidden ones.
+- **`transactions`:** the same columns as the source edges, plus `is_illicit` and `taint`.
+  - `is_illicit = 1` if the sender or receiver is an illicit agent, or if `taint ≥ θ` (default 0.5).
+  - `taint` is the haircut share `τ` of the transfer, from the fund inventory (§6.7).
+  - This labelling convention is a configuration choice, not a behaviour. TransXion also propagates labels along fund traces.
+- **`hidden_state_log`** (daily, per agent): `z`, balance, inventory taint share, group, and alive/dormant.
+- **Two releases:** the full world log and its projection `O(world)`.
+- Only node-level labels can be checked against real data, because the real labels are node-level (§7.4). Transaction labels are synthetic by construction, and the documentation says so.
+
+### 6.10 Learned vs hand-designed
+
+| Learned from data | Hand-designed (engineering or measurement) |
+|---|---|
+| Event kinds, timing (Δt, diurnal and weekly), lifetimes and dormancy | Architecture and field order |
+| Counterparty gate and choices (memory, venues, groups, agents, exploration) | The event loop and the redraw rule |
+| Amounts, including their dependence on the ledger | Ledger and inventory arithmetic; fees drawn from the real fee distribution |
+| Role differences, latent types, profiles | Thresholds: hub, `S_pub`, dust floor (copied from the pipeline) |
+| Group sizes and role mix; activation rates | Observation operator (from the pipeline SQL) |
+| | Taint rule and θ; scenario knobs (N, π, horizon) |
+
+## 7. Evaluation
+
+**Noise floor.** For every distributional metric, the noise floor is the same metric between two disjoint random halves of the real comparison split. It is bootstrapped 20 times, with sample sizes matched to the synthetic comparison. A metric "passes" at ≤ 2× its noise floor. Fidelity results (§7.2, §7.3) are reported per role, per cohort and per account-age tercile.
+
+**Split discipline.** Every threshold, early stop, checkpoint and model choice uses the **validation** groups. The **test** groups are sealed. They are used once per phase, for the reported numbers.
+
+### 7.1 Next-event prediction (P1; real test split)
+
+- Per-field negative log-likelihood (NLL), with `z` marginalized over its prefix posterior from Phase 2 (§6.5).
+- Next-kind error rate and Δt-bin accuracy. These are FINESSE/EasyTPP-style metrics, plus time MAE on `log Δt`.
+- Counterparty-class accuracy and REPEAT Hits@{1,5} over the full partner table.
+- Amount NLL and MAE on `log10`.
+
+**Baselines:**
+- B0: per-role marginals with a Markov-1 model on kind.
+- B1: a GRU with the same heads (BankGAN's StackedLSTM analogue).
+- B2: Banksformer-adapted. Δt, hour and weekday heads trained independently with cross-entropy and combined as a product at sampling (the original recipe), trained on uncensored prefixes only. It has no counterparty head and a single-Gaussian amount.
+
+### 7.2 Single-agent generative fidelity (P1–P2)
+
+Generate one stream per test agent, conditioned on its real role, cohort, activation time and profile (paired), with `z` drawn from `p(z | role, cohort, profile)`. Also generate unconditionally from sampled profiles.
+
+| ID | Metric | Distance |
+|---|---|---|
+| M1 | log10 amount, overall and per kind | W1 |
+| M2 | log Δt | W1 |
+| M3 | kind | JSD |
+| M4 | hour-of-day | JSD |
+| M5 | day-of-week | JSD |
+| M6 | kind 3-gram | JSD |
+| M7 | joint (kind, hour), the Banksformer joint analogue | JSD |
+| M8 | counterparty class | JSD |
+| M9 | per-agent repeat rate | W1 |
+| M10 | distinct counterparties per agent | W1 |
+| M11 | events per agent | W1 |
+| M12 | active span | W1 |
+| M13 | out-fraction per agent | W1 |
+| M14 | per-agent hour entropy | W1 |
+| M15 | monthly net flow per agent (Banksformer cash-flow analogue) | W1 |
+| M16 | end-of-window observed balance (sweeping) | W1 |
+
+**Role-signal parity.** Train XGBoost on real-train per-agent summaries (M9–M16 features plus profile) to predict role. Compare its AUC on real test with its AUC on synthetic agents. A large gap in either direction is a failure: a higher synthetic AUC means caricature; a lower one means the signal was lost.
+
+### 7.3 World structure (P3; on O(world) vs R_W)
+
+- **TransXion RQ1 set** on daily undirected projections: GCC ratio, number of components, max k-core, max-core fraction, degree assortativity and transitivity.
+- **Clauset power-law fits** (with lognormal likelihood ratio) for unique degree, transaction-count degree, strength and amount.
+- **Coupling metrics:**
+  - shared-counterparty fraction per agent (real: 0.40 normal, 0.68 scam);
+  - group size distribution;
+  - agent↔agent event fraction (real: about 1%).
+- **Engine check:** the causality and ordering invariants hold (§6.7), and a fixed seed reproduces the world exactly.
+
+### 7.4 AML utility and criticism tests (P3+)
+
+- **TSTR (headline; T4).** Detectors trained on synthetic and tested on real test-split groups, for node-level illicit classification. Report AUC, AP and F1, next to train-real/test-real (TRTR). Detectors: logistic regression, random forest, XGBoost, LightGBM, and a GNN once one is feasible (Multi-GIN, as in TransXion).
+- **Detector-ranking agreement.** Spearman correlation between the detector ranking on synthetic→synthetic and on real→real.
+- **Difficulty parity (T3).** At **matched prevalence** (the synthetic test set subsampled to the real test split's illicit rate), AP on synthetic→synthetic should be within ±0.05 of AP on real→real. Other prevalence scenarios are reported separately. LPW targets realism, not maximal hardness.
+- **Shortcut audit (C2).** Single-feature AUC for the top 20 features, synthetic vs real. Flag any |Δ| > 0.1. Template-like shortcuts show up as single features that are near-perfect in synthetic data but not in real data.
+- **Profile-gain parity (C1).** The change in detector AUC/AP from adding profile features. It should have the same sign on synthetic and real, with |difference| ≤ 0.05.
+- **Seam test (T2).** C2ST: a classifier separating real from synthetic agents, run per role. Pass only if both conditions hold:
+  - `AUC ≤ 0.70` for *each* role (absolute distinguishability);
+  - `AUC_illicit − AUC_normal ≤ 0.05`, meaning illicit agents are no easier to spot as synthetic than normal agents are.
+- **Mode coverage (C2).** Improved precision and recall (Kynkäänniemi et al., 2019) on Phase 2 encoder embeddings, per role.
+- **Memorization.** Distance to closest record (DCR): synthetic→train distances should be no smaller than test→train distances (5th-percentile ratio ≥ 1). This guards against copying real phishing traces.
+
+### 7.5 Confound controls (applies to all of §7.4)
+
+Account age, era, cohort and their proxies are strongly confounded with the label. The proxies are days active, lifetime counts and volumes, and profile missingness. Every utility number is reported three ways:
+1. with all features;
+2. without age, era, cohort and proxy features;
+3. **matched on common support.** Fit a propensity model for role on age, era, cohort and the proxies, using the train split. Trim to overlapping propensity, match illicit and normal agents, and report the effective N per role.
+
+The **conditional baseline** is a detector that uses only those confounder features, evaluated in the same matched sample. Behavioural signal is the full detector's gain over that baseline inside the matched sample. If the matched sample has fewer than 200 agents per role, the claim is reported as "not testable in the pilot" and deferred to P5.
+
+The thresholds in §7 are initial targets, recalibrated on validation data once P1 results and noise floors exist. Any change is recorded in this file.
+
+## 8. Phases, exit criteria and compute estimates
+
+The estimates are for the GTX 1650 Super. Each one is replaced by a measurement before the matching run (§9).
+
+| Phase | Work | Exit criteria | Est. wall time | Where |
+|---|---|---|---|---|
+| **P0** Data audit + pilot slice | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.3 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
+| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | Beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | ≤ 30 min per training run; ≤ 4 h for the whole phase grid | local |
+| **P2** Latent types | Encoder, GMM, `z`-conditioning, ablation against no-`z`. | Keep `z` only if M9–M16 or role parity improve on validation, with nothing getting worse beyond noise. Otherwise drop it and record why. | ≤ 1 h | local |
+| **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | §7.3 metrics reported against `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. | Sequential simulation of about 7k agents for 12 months (about 0.5–1M events at an assumed 2–5 ms per batch-1 pass): 0.5–1.5 h. P0 measures the pass latency. GNN detector: 1–3 h. | local; GNN borderline |
+| **P5** Scale-up | Multiple eras (2017–2025, about 21 GB), all non-hub seeds with an era covariate. This gives young *normal* accounts from 2017–2018 and tests extrapolation (R1). Contracts become passive sinks. | P1 and P3 metrics hold in each era. | Data build 2–4 h; training 1–3 h; simulation 3–8 h | **likely cloud** |
+
+P4 is intentionally absent: hardening moved to future work (§10).
+
+## 9. Compute policy
+
+- Before every run longer than a smoke test, project the wall time from measured throughput (tokens/s, events/s).
+- If a single experiment is projected to take **more than 4 h** locally, or will not fit in 4 GB of VRAM or about 8 GB of free RAM even after reasonable reductions, **stop and ask the user** whether to rent a cloud GPU. The message gives the estimate and the reason.
+- Never shrink the evaluation silently to stay inside the budget.
+
+## 10. Risks and open questions
+
+| ID | Risk | Mitigation |
+|---|---|---|
+| R1 | Label/age confound (AUC 0.93). The pilot has almost no young normal accounts (66 born in W). | Condition on age and cohort. Matched evaluation (§7.5). Treat young-normal simulation as unvalidated until P5. |
+| R2 | Small normal population (at most 2,941 agents) | Small model, early stopping, group split. P5 adds eras. |
+| R3 | Native-ETH-only blind spot (ERC-20 approvals, internal transactions) | Documented as the scope of the output. ERC-20 counts appear only as profile fields. |
+| R4 | Observed balances are unreliable | Soft ledger with a calibrated tolerance. Labels use a separate non-negative inventory (§6.7). |
+| R5 | The product-of-heads time law is too restrictive | Ablation A1 and baseline B2. |
+| R6 | Biased 2-hop sampling | v1 uses only complete agent-incident E1 edges (§6.8). |
+| R7 | Noisy curated labels; scam labels on token contracts | Report the description mix. Contracts are out of pilot scope. |
+| R8 | Venue-ID shortcuts | Split by group, group-scoped pools, shortcut audit. |
+| R9 | The exact sequential engine is slow at P5 scale | CUDA graphs for batch-1 passes, and a KV cache only for streams that have not yet filled the window (§6.7). For P5, a parallel optimistic (Time Warp-style) engine with rollback, validated against the sequential engine on small worlds. |
+
+**Future work (not v1):**
+- **Second-hop (layering) model.** It needs provenance: full transaction histories of L1 nodes, for example from the public BigQuery `crypto_ethereum.transactions` table that the pipeline itself used. Then forwarding and non-forwarding are both observable.
+- **Realism-constrained hardening.** KL-regularized GRPO on the illicit policy's own actions (TransXion App. A advantage), with a monitor from one detector family and evaluation on another. Guards use validation groups only. Policies are not released. Likely needs a cloud GPU.
+- Latent drift (FINESSE behaviour switching).
+- A bank/exchange monitoring agent that freezes flagged accounts, analogous to the FINESSE policy stream, with illicit agents that adapt to it.
+- ERC-20 streams.
+- KYC-style profiles for transfer to bank AML.
+
+## 11. Planned layout and tooling
+
+```
+SPEC.md
+pyproject.toml            # uv; Python 3.12; torch (CUDA), polars, numpy, scikit-learn, xgboost, lightgbm, igraph, powerlaw, pytest
+src/lpw/data/             # download, audit, slice building (streams, cohorts, profiles, venues, groups, splits)
+src/lpw/model/            # policy transformer, time law, heads, partner table, profile generator, baselines
+src/lpw/sim/              # world engine, ledger, fund inventory, observation operator, labels
+src/lpw/eval/             # metrics M1–M16, structure, detectors, TSTR, matched evaluation, audits
+configs/                  # one YAML per run; seeds fixed
+tests/                    # unit tests, starting with the time law (normalization, survival, sampling) and the engine causality invariant
+data/, runs/              # git-ignored
+```
+
+Downloaded files are untrusted. Raw data goes in `data/raw/` and is only read by scripts that live outside it, and no tool is run from inside it.
