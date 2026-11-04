@@ -14,8 +14,8 @@ import polars as pl
 import torch
 
 from lpw.p1.batch import CTX, collate, time_cont, to_torch
-from lpw.p1.model import phi
-from lpw.p1.store import DUST_LOG10, NEW, OUT, PERIPHERY, REPEAT, TIER_VENUE, VENUE, month_index
+from lpw.p1.model import component_mass, phi
+from lpw.p1.store import DUST_LOG10, NEW, OUT, PERIPHERY, REPEAT, SUPPLY_LOG10, TIER_VENUE, VENUE, month_index
 from lpw.p1.timelaw import dt_bin, hour_dow
 
 FIELDS = ("kind", "ts", "cls", "ent", "venue", "amt", "eth", "fee", "bal", "dt", "dtbin", "hour", "dow", "month")
@@ -195,15 +195,15 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
 def _sample_trunc_mog(params, k, g):
     logit, mu, ls = params.double().split(k, -1)
     sig = torch.exp(ls.clamp(-4, 2))
-    # component weights renormalized by each component's mass above the floor
-    a = (DUST_LOG10 - mu) / sig
-    lw = torch.log_softmax(logit, -1) + torch.special.log_ndtr(-a)
+    # component weights renormalized by each component's mass inside [floor, supply], then an exact truncated draw
+    lw = torch.log_softmax(logit, -1) + component_mass(mu, sig)
     m = torch.multinomial(torch.softmax(lw, -1), 1, generator=g)[:, 0]
-    mu_m, sig_m, a_m = mu.gather(1, m[:, None])[:, 0], sig.gather(1, m[:, None])[:, 0], a.gather(1, m[:, None])[:, 0]
-    lo = torch.special.ndtr(a_m)
+    mu_m, sig_m = mu.gather(1, m[:, None])[:, 0], sig.gather(1, m[:, None])[:, 0]
+    lo = torch.special.ndtr((DUST_LOG10 - mu_m) / sig_m)
+    hi = torch.special.ndtr((SUPPLY_LOG10 - mu_m) / sig_m)
     u = torch.rand(len(m), dtype=torch.float64, device=params.device, generator=g)
-    p = (lo + u * (1 - lo)).clamp(1e-15, 1 - 1e-15)
-    return torch.maximum(mu_m + sig_m * torch.special.ndtri(p), torch.full_like(mu_m, DUST_LOG10))
+    p = (lo + u * (hi - lo)).clamp(1e-15, 1 - 1e-15)
+    return (mu_m + sig_m * torch.special.ndtri(p)).clamp(DUST_LOG10, SUPPLY_LOG10)
 
 
 def _frames(streams, conds):

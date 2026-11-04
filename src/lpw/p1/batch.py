@@ -16,7 +16,7 @@ Tiling:
 import numpy as np
 import torch
 
-from lpw.p1.store import IN_AGENT, OUT, PAD, PROFILE, REPEAT, derived
+from lpw.p1.store import IN_AGENT, OUT, PAD, PROFILE, REPEAT, SUPPLY_ETH, derived
 from lpw.p1.timelaw import dt_bin, hour_dow
 
 CTX = 255
@@ -113,8 +113,9 @@ def _entry_state(v: dict, s: int, ks: np.ndarray, P: int):
     ent, kind, eth, ts = v["ent"], v["kind"], v["eth"], v["ts"]
     R = len(ks)
     cnt = np.zeros((R, P), np.float32)
-    tin = np.zeros((R, P), np.float32)
-    tout = np.zeros((R, P), np.float32)
+    # totals stay float64: generated heavy-tail amounts can exceed the float32 range
+    tin = np.zeros((R, P), np.float64)
+    tout = np.zeros((R, P), np.float64)
     last = np.full((R, P), -1, np.int64)
     if P == 0 or R == 0:
         return cnt, tin, tout, np.zeros((R, P), np.float64), last
@@ -158,7 +159,7 @@ def _entry_state(v: dict, s: int, ks: np.ndarray, P: int):
 
 
 def _led(b):
-    b = np.asarray(b, np.float64)
+    b = np.clip(np.asarray(b, np.float64), -SUPPLY_ETH, SUPPLY_ETH)
     return np.stack([np.log1p(np.abs(b)) / 5.0, np.sign(b)], -1)
 
 
@@ -245,8 +246,8 @@ def collate(views: list[dict], specs: list[tuple[int, np.ndarray]], n_venues: in
             ent_parts.append((st, v["e_tier"][:P], v["e_sc"][:P], v["e_venue"][:P]))
             pmax = max(pmax, P)
     No = len(orow["row"])
-    E = {"count": np.zeros((No, pmax), np.float32), "tin": np.zeros((No, pmax), np.float32),
-         "tout": np.zeros((No, pmax), np.float32), "last": np.zeros((No, pmax), np.float64),
+    E = {"count": np.zeros((No, pmax), np.float32), "tin": np.zeros((No, pmax), np.float64),
+         "tout": np.zeros((No, pmax), np.float64), "last": np.zeros((No, pmax), np.float64),
          "wpos": np.full((No, pmax), -1, np.int64), "tier": np.full((No, pmax), 3, np.int64),
          "sc": np.zeros((No, pmax), bool), "venue": np.full((No, pmax), -1, np.int64)}
     r0 = 0

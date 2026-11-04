@@ -19,6 +19,8 @@ OUT, IN_EXO, IN_AGENT, PROFILE, PAD = 0, 1, 2, 3, 4
 REPEAT, VENUE, NEW = 0, 1, 2
 PERIPHERY, TIER_VENUE, TIER_AGENT = 0, 1, 2
 DUST_LOG10 = -4.0  # 1e14 wei
+SUPPLY_ETH = 1.2e8  # total ETH supply: no transfer, balance or partner total can exceed it (an environment bound,
+SUPPLY_LOG10 = float(np.log10(SUPPLY_ETH))  # like the dust floor; no real value comes near it)
 
 PROFILE_FIELDS = [
     "days_active", "normal_sent_cnt", "normal_recv_cnt", "normal_failed_cnt", "normal_to_contract_cnt", "normal_to_eoa_cnt",

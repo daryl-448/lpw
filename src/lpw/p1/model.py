@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lpw.p1.batch import CTX, N_TIME_CONT, N_TOK_CONT
-from lpw.p1.store import DUST_LOG10, OUT, PAD, REPEAT, VENUE
+from lpw.p1.store import DUST_LOG10, OUT, PAD, REPEAT, SUPPLY_ETH, SUPPLY_LOG10, VENUE
 from lpw.p1.timelaw import EDGES, TimeLaw
 
 N_PHI = 18
@@ -62,17 +62,29 @@ def phi(count, rec, tin, tout, tier, in_ctx):
     centers = torch.linspace(0, 17.5, 10, device=count.device)
     rbf = torch.exp(-(((lr[..., None] - centers) / 1.75) ** 2))
     t1 = F.one_hot(tier.clamp(0, 3), 4)[..., :3].float()
-    return torch.cat([lc[..., None] / 3, lr[..., None] / 17, rbf, torch.log1p(tin)[..., None] / 5,
-                      torch.log1p(tout)[..., None] / 5, t1, in_ctx[..., None].float()], -1)
+    tin, tout = tin.double().clamp(max=SUPPLY_ETH), tout.double().clamp(max=SUPPLY_ETH)
+    return torch.cat([lc[..., None] / 3, lr[..., None] / 17, rbf, (torch.log1p(tin) / 5).float()[..., None],
+                      (torch.log1p(tout) / 5).float()[..., None], t1, in_ctx[..., None].float()], -1)
+
+
+def component_mass(mu, sig):
+    """log of each Gaussian component's mass inside [dust floor, total supply] (float64)."""
+    mu, sig = mu.double(), sig.double()
+    hi = torch.special.ndtr((SUPPLY_LOG10 - mu) / sig)
+    lo = torch.special.ndtr((DUST_LOG10 - mu) / sig)
+    # upper-tail form keeps precision when the component sits far above the floor
+    up = torch.special.ndtr((mu - DUST_LOG10) / sig) - torch.special.ndtr((mu - SUPPLY_LOG10) / sig)
+    return torch.log(torch.clamp(torch.where(mu > DUST_LOG10, up, hi - lo), min=1e-300))
 
 
 def trunc_mog_logpdf(params, a, k):
+    """Mixture of Gaussians on log10 ETH truncated to [dust floor, total supply], renormalized."""
     logit, mu, ls = params.split(k, -1)
     sig = torch.exp(ls.clamp(-4, 2))
     lw = torch.log_softmax(logit, -1)
     lp = lw - 0.5 * ((a[:, None] - mu) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
-    tail = torch.logsumexp(lw + torch.special.log_ndtr((mu - DUST_LOG10) / sig), -1)
-    return torch.logsumexp(lp, -1) - tail
+    tail = torch.logsumexp(lw.double() + component_mass(mu, sig), -1)
+    return torch.logsumexp(lp, -1) - tail.float()
 
 
 def gauss_logpdf(params, a):
@@ -83,7 +95,7 @@ def gauss_logpdf(params, a):
 
 def mog_mean(params, k):
     logit, mu, _ = params.split(k, -1)
-    return (torch.softmax(logit, -1) * mu).sum(-1).clamp(min=DUST_LOG10)
+    return (torch.softmax(logit, -1) * mu).sum(-1).clamp(DUST_LOG10, SUPPLY_LOG10)
 
 
 class Model(nn.Module):

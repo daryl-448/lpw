@@ -71,6 +71,9 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     cfg = CONFIGS[model_name]
     model = Model(cfg, store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # constant-LR Adam stalls short of the optimum (Phase 1 diagnosis: 2018 LPW gained 0.16 val nats from a 1e-4
+    # fine-tune and its stopping probability was under-fit), so the LR decays on validation plateaus
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.3, patience=2, min_lr=1e-5)
     scaler = torch.amp.GradScaler()
     vb = pack(val_specs(store, store.agents("val")), views)
     out.mkdir(parents=True, exist_ok=True)
@@ -83,8 +86,9 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
         tl, tn = 0.0, 0
         for b in loader(views, tb):
             b = to_dev(b, dev)
-            for g in opt.param_groups:
-                g["lr"] = lr * min(1.0, (step + 1) / warm)
+            if step < warm:
+                for g in opt.param_groups:
+                    g["lr"] = lr * (step + 1) / warm
             loss, _ = model.loss(b)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -96,7 +100,10 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             tl += loss.item()
             tn += 1
         vl = val_loss(model, views, vb, dev)
-        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "sec": round(time.time() - t, 1), "steps": step})
+        if step >= warm:
+            sched.step(vl)
+        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "lr": opt.param_groups[0]["lr"],
+                     "sec": round(time.time() - t, 1), "steps": step})
         log(f"[{model_name}] ep {ep} train {tl / max(tn, 1):.4f} val {vl:.4f} ({time.time() - t:.0f}s)")
         if vl < best - 1e-4:
             best, best_ep = vl, ep
