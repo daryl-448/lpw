@@ -171,13 +171,13 @@ Full numbers: [reports/p0_audit.md](reports/p0_audit.md). Raw JSON: `runs/p0_aud
 | `activity_end_ts` | Never earlier than the last edge. For the 2,303 agents whose activity ends inside W, the median lag is 0 days. |
 | Observed balance | Negative pre-W balance proxy for 43% of pre-existing agents. OUT events that leave the balance negative: 55% normal, 89% scam. Adding daily internal-transaction flows only brings this to 51% and 85%. |
 | Groups | Connected components fail: one component holds 47% of agents (78% scam), and it persists for every `S_pub` > 2. Louvain communities work: the largest is 9.3% of agents. 2,206 of 5,721 shared non-venue counterparties span splits. |
-| Confound | Age-only AUC 0.96 (0.92 within the pre-existing cohort). Confounder-only AUC 0.95–0.97. Matched pairs on common support: 301 train, 102 val, 99 test. |
+| Confound | Age-only AUC 0.96 (0.92 within the pre-existing cohort). Confounder-only AUC 0.95–0.97. Matched pairs on common support: 312 train, 85 val, 107 test. |
 | Throughput (GTX 1650 Super, 0.83M-param model, fp16) | Training 68.5k tokens/s at B64×L256, so about 7 s per epoch over the slice. Batch-1 L256 pass 1.66 ms, so the sequential engine needs about 15–30 min for the pilot world. Peak memory 0.47 GB. |
 
 **Decisions taken from these measurements** (they supersede the matching text above and below):
 1. **Groups are Louvain communities** (fixed seed, label-blind) of the agent–counterparty graph after removing venues, not connected components. `component_id` is kept for reference. Leakage through shared non-venue counterparties does not affect TSTR, because the generator never sees those addresses as identities and TSTR detectors train only on synthetic data. Detectors trained on real data are also reported on the **clean test subset**: test agents with no non-venue counterparty shared with a train agent (344 normal, 327 scam).
 2. **The observed balance is an input feature only**, in every phase. With 51–89% of OUT events leaving it negative, a conservation tolerance would be meaningless, so the Phase 3 redraw rule is dropped. Labels still use the separate non-negative fund inventory (§6.7).
-3. **The confound-matched utility test is not testable in this pilot window.** The test split has 99 matched pairs, below the 200 required by §7.5. P1–P3 still run for fidelity and structure, and utility is reported with the "not testable" flag until a window with overlapping account ages is added (P5).
+3. **The confound-matched utility test is not testable in this pilot window.** The test split has 107 matched pairs, below the 200 required by §7.5. P1–P3 still run for fidelity and structure, and utility is reported with the "not testable" flag until a window with overlapping account ages is added (P5).
 
 ### 5.3 Consequences for the design
 
