@@ -67,14 +67,20 @@ def phi(count, rec, tin, tout, tier, in_ctx):
                       (torch.log1p(tout) / 5).float()[..., None], t1, in_ctx[..., None].float()], -1)
 
 
+def log_interval_mass(a, b):
+    """log(Φ(b) − Φ(a)) for a < b, stable in both tails: an interval entirely right of the mean is computed as
+    Φ(−a) − Φ(−b), one entirely left as Φ(b) − Φ(a), each as log Φ(x) + log1p(−exp(log Φ(y) − log Φ(x)))."""
+    ln = torch.special.log_ndtr
+    right = ln(-a) + torch.log1p(-torch.exp(torch.clamp(ln(-b) - ln(-a), max=0.0)))
+    left = ln(b) + torch.log1p(-torch.exp(torch.clamp(ln(a) - ln(b), max=0.0)))
+    mid = torch.log1p(-(torch.special.ndtr(a) + torch.special.ndtr(-b)))
+    return torch.where(a > 0, right, torch.where(b < 0, left, mid))
+
+
 def component_mass(mu, sig):
     """log of each Gaussian component's mass inside [dust floor, total supply] (float64)."""
     mu, sig = mu.double(), sig.double()
-    hi = torch.special.ndtr((SUPPLY_LOG10 - mu) / sig)
-    lo = torch.special.ndtr((DUST_LOG10 - mu) / sig)
-    # upper-tail form keeps precision when the component sits far above the floor
-    up = torch.special.ndtr((mu - DUST_LOG10) / sig) - torch.special.ndtr((mu - SUPPLY_LOG10) / sig)
-    return torch.log(torch.clamp(torch.where(mu > DUST_LOG10, up, hi - lo), min=1e-300))
+    return log_interval_mass((DUST_LOG10 - mu) / sig, (SUPPLY_LOG10 - mu) / sig)
 
 
 def trunc_mog_logpdf(params, a, k):

@@ -199,11 +199,28 @@ def _sample_trunc_mog(params, k, g):
     lw = torch.log_softmax(logit, -1) + component_mass(mu, sig)
     m = torch.multinomial(torch.softmax(lw, -1), 1, generator=g)[:, 0]
     mu_m, sig_m = mu.gather(1, m[:, None])[:, 0], sig.gather(1, m[:, None])[:, 0]
-    lo = torch.special.ndtr((DUST_LOG10 - mu_m) / sig_m)
-    hi = torch.special.ndtr((SUPPLY_LOG10 - mu_m) / sig_m)
-    u = torch.rand(len(m), dtype=torch.float64, device=params.device, generator=g)
-    p = (lo + u * (hi - lo)).clamp(1e-15, 1 - 1e-15)
-    return (mu_m + sig_m * torch.special.ndtri(p)).clamp(DUST_LOG10, SUPPLY_LOG10)
+    return mu_m + sig_m * _trunc_std_normal((DUST_LOG10 - mu_m) / sig_m, (SUPPLY_LOG10 - mu_m) / sig_m, g)
+
+
+def _trunc_std_normal(a, b, g):
+    """Exact draw of Z ~ N(0,1) restricted to [a, b], by inverse CDF on the side of the mean the interval lies on
+    (so tail intervals keep their precision). Intervals beyond ~37σ, where Φ underflows, use the exponential tail
+    limit z = edge + E / edge (E ~ Exp(1)), which is exact to O(1/edge²)."""
+    u = torch.rand(a.shape, dtype=torch.float64, device=a.device, generator=g)
+    ln = torch.special.log_ndtr
+    # right tail: Z = -Φ^-1(p) with p uniform on [Φ(-b), Φ(-a)]; left tail and middle: Z = Φ^-1(p), p on [Φ(a), Φ(b)]
+    flip = a > 0
+    lo = torch.where(flip, ln(-b), ln(a))
+    hi = torch.where(flip, ln(-a), ln(b))
+    lp = hi + torch.log1p(-u * (1 - torch.exp(torch.clamp(lo - hi, max=0.0))))  # log(P_hi − u·(P_hi − P_lo)), P = Φ
+    z = torch.special.ndtri(torch.exp(lp).clamp(min=1e-300, max=1 - 1e-16))
+    z = torch.where(flip, -z, z)
+    edge = torch.where(flip, a, -b)
+    far = (edge > 37) & ((flip & (a > 37)) | (~flip & (b < -37)))
+    e = -torch.log(torch.clamp(torch.rand(a.shape, dtype=torch.float64, device=a.device, generator=g), min=1e-300))
+    zt = torch.where(flip, a + e / a.clamp(min=1.0), b - e / (-b).clamp(min=1.0))
+    z = torch.where(far, zt, z)
+    return torch.minimum(torch.maximum(z, a), b)
 
 
 def _frames(streams, conds):
