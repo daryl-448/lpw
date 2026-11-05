@@ -58,7 +58,8 @@ def cutoff_ts(store, months: int) -> int:
 
 
 def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, patience=6, lr=1e-3, cutoff_months=0,
-          dev="cuda", log=print) -> dict:
+          dev="cuda", log=print, init: Path | None = None, warm: int = 300) -> dict:
+    """init: fine-tune from this checkpoint (missing parameters, e.g. a new plan embedding, keep their init)."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
@@ -70,6 +71,10 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     views = Views(store)
     cfg = CONFIGS[model_name]
     model = Model(cfg, store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
+    if init is not None:
+        missing, unexpected = model.load_state_dict(torch.load(init, map_location=dev), strict=False)
+        assert not unexpected, unexpected
+        log(f"fine-tune from {init}; new parameters: {missing}")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     # constant-LR Adam stalls short of the optimum (Phase 1 diagnosis: 2018 LPW gained 0.16 val nats from a 1e-4
     # fine-tune and its stopping probability was under-fit), so the LR decays on validation plateaus
@@ -77,8 +82,9 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     scaler = torch.amp.GradScaler()
     vb = pack(val_specs(store, store.agents("val")), views)
     out.mkdir(parents=True, exist_ok=True)
+    for stale in ("recal.json", "model_raw.pt"):  # a new checkpoint invalidates an earlier recalibration
+        (out / stale).unlink(missing_ok=True)
     best, best_ep, hist, step = float("inf"), -1, [], 0
-    warm = 300
     ref_rows = None  # constant per-step normaliser, fixed from the first epoch's packing
     for ep in range(epochs):
         model.train()
@@ -96,11 +102,14 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             # model.loss is a per-batch mean; batches hold very different row counts and packing groups prefixes
             # by full-stream cost, so a plain mean weights prefixes by 1/rows(batch), which correlates with
             # whether the stream is about to end (it biased the stopping probability). Sum / constant instead.
-            loss = loss * ((len(b["o_row"]) if cfg.b2 else len(b["row_b"])) / ref_rows)
+            scale = (len(b["o_row"]) if cfg.b2 else len(b["row_b"])) / ref_rows
+            loss = loss * scale
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # the clip threshold scales with the batch too: a fixed threshold renormalises every clipped step back
+            # to the old batch-mean weighting (almost every step clips early on)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0 * scale)
             scaler.step(opt)
             scaler.update()
             step += 1
@@ -118,6 +127,7 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
         elif ep - best_ep >= patience:
             break
     info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep, "ref_rows": ref_rows,
+            "init": str(init) if init else None, "lr": lr,
             "cutoff": cutoff, "params": sum(p.numel() for p in model.parameters()), "history": hist}
     (out / "train.json").write_text(json.dumps(info, indent=1))
     from lpw.p1.recal import ensure_recalibrated
@@ -141,8 +151,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--cutoff-months", type=int, default=0)
     ap.add_argument("--seed", type=int, default=20261104)
+    ap.add_argument("--init", default=None, help="fine-tune from this checkpoint")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--warm", type=int, default=300)
     a = ap.parse_args()
-    train(Path(a.pilot), a.model, Path(a.out), seed=a.seed, epochs=a.epochs, cutoff_months=a.cutoff_months)
+    train(Path(a.pilot), a.model, Path(a.out), seed=a.seed, epochs=a.epochs, cutoff_months=a.cutoff_months,
+          init=Path(a.init) if a.init else None, lr=a.lr, warm=a.warm)
 
 
 if __name__ == "__main__":

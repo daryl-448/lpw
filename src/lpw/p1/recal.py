@@ -68,8 +68,10 @@ def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, 
     if model.cfg.b2:
         return {"skipped": "b2"}
     model.eval()
+    model.plan_inference = model.cfg.plan  # plan models generate with s known, so recalibrate with the real (train) s
     views = views or Views(store)
     C = _cache(model, store, views, dev)
+    model.plan_inference = False
     last = model.time_head[2]
     params = [last.weight, last.bias]
     req = {p: p.requires_grad for p in model.parameters()}

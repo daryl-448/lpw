@@ -39,6 +39,7 @@ class Cfg:
     heads: int = 4
     ff: int = 512
     dropout: float = 0.1
+    plan: bool = False     # per-agent plan latent through the PROFILE token (lpw.p1.plan)
 
 
 CONFIGS = {
@@ -48,6 +49,7 @@ CONFIGS = {
     "b0": Cfg("b0", enc="marg"),
     "b1": Cfg("b1", enc="gru"),
     "b2": Cfg("b2", k_mix=1, b2=True),
+    "lpw_plan": Cfg("lpw_plan", plan=True),
 }
 
 
@@ -133,6 +135,14 @@ class Model(nn.Module):
         else:
             self.m_kind = nn.Embedding(2 * 5, d)
             self.m_role = nn.Embedding(2, d)
+        if cfg.plan:
+            from lpw.p1.plan import N_PLAN_A, N_PLAN_N
+            self.e_plan_n = nn.Embedding(N_PLAN_N + 1, d)  # last index = unknown
+            self.e_plan_a = nn.Embedding(N_PLAN_A + 1, d)
+            nn.init.zeros_(self.e_plan_n.weight)  # starts as a no-op on a fine-tuned checkpoint
+            nn.init.zeros_(self.e_plan_a.weight)
+        # plan latent at inference: False = unknown (NLL evaluation; no future information), True = use B["plan_*"]
+        self.plan_inference = False
         self.kind_head = mlp(d, d, 2)
         self.e_tkind = nn.Embedding(2, d)
         self.time_head = mlp(2 * d, d, 64 + 24 + 7)
@@ -165,6 +175,15 @@ class Model(nn.Module):
         x = (self.e_kind(B["tok_kind"]) + self.e_cls(B["tok_cls"]) + self.e_venue(B["tok_venue"]) + self.e_tier(B["tok_tier"])
              + self.e_dtbin(B["tok_dtbin"]) + self.e_month(B["tok_month"]) + self.tok_cont(B["tok_cont"]))
         p = self.e_role(B["role"]) + self.e_cohort(B["cohort"]) + self.prof_mlp(torch.cat([B["prof"], B["ocont"]], -1))
+        if self.cfg.plan:
+            from lpw.p1.plan import N_PLAN_A, N_PLAN_N, P_DROP
+            pn, pa = B["plan_n"], B["plan_a"]
+            if self.training:  # drop s to "unknown" at random so the same network also models s-unknown
+                drop = torch.rand(pn.shape, device=pn.device) < P_DROP
+                pn, pa = torch.where(drop, N_PLAN_N, pn), torch.where(drop, N_PLAN_A, pa)
+            elif not self.plan_inference:
+                pn, pa = torch.full_like(pn, N_PLAN_N), torch.full_like(pa, N_PLAN_A)
+            p = p + self.e_plan_n(pn) + self.e_plan_a(pa)
         x = torch.cat([p[:, None], x[:, 1:]], 1)
         L = x.shape[1]
         x = x + self.pos(torch.arange(L, device=x.device))[None]

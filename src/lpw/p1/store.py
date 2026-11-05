@@ -81,6 +81,8 @@ class Store:
     venue_ids: np.ndarray
     prof_mu: np.ndarray = field(default=None)
     prof_sd: np.ndarray = field(default=None)
+    plan_n: np.ndarray = field(default=None)   # per-agent plan latent (lpw.p1.plan); used only by plan models
+    plan_a: np.ndarray = field(default=None)
 
     @property
     def n_agents(self) -> int:
@@ -100,6 +102,8 @@ class Store:
         v.update(e_tier=self.e_tier[es:ee], e_sc=self.e_sc[es:ee], e_venue=self.e_venue[es:ee])
         v.update(origin=int(self.origin[a]), obs_end=int(self.obs_end[a]), role=int(self.role[a]), cohort=int(self.cohort[a]),
                  prof=self.prof_vec(a), bal_end=self.bal_end(a))
+        if self.plan_n is not None:
+            v.update(plan_n=int(self.plan_n[a]), plan_a=int(self.plan_a[a]))
         return v
 
     def bal_end(self, a: int) -> float:
@@ -218,6 +222,8 @@ def build_store(pilot: Path, cutoff: int | None = None, raw: Path = Path("data/r
     tr = (split == "train") & (cohort == 0)
     x = profile_transform(prof_raw[tr])
     st.prof_mu, st.prof_sd = x.mean(0), x.std(0) + 1e-6
+    from lpw.p1.plan import plan_targets
+    st.plan_n, st.plan_a, _ = plan_targets(st)
     return st
 
 

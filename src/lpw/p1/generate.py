@@ -39,6 +39,8 @@ class Stream:
         v.update(e_tier=np.array(self.e_tier, np.int8), e_sc=np.array(self.e_sc, bool), e_venue=np.array(self.e_venue, np.int16),
                  origin=int(self.cond["origin"]), obs_end=self.w_end, role=int(self.cond["role"]),
                  cohort=int(self.cond["cohort"]), prof=self.cond["prof"], bal_end=self.b)
+        if "plan_n" in self.cond:  # plan models: the agent's plan latent (oracle or prior draw)
+            v.update(plan_n=int(self.cond["plan_n"]), plan_a=int(self.cond["plan_a"]))
         return v
 
     def append(self, rec: dict):
