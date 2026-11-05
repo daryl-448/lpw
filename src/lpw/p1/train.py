@@ -79,10 +79,13 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     out.mkdir(parents=True, exist_ok=True)
     best, best_ep, hist, step = float("inf"), -1, [], 0
     warm = 300
+    ref_rows = None  # constant per-step normaliser, fixed from the first epoch's packing
     for ep in range(epochs):
         model.train()
         t = time.time()
         tb = pack(train_specs(store, store.agents("train"), rng), views, rng=rng)
+        if ref_rows is None:
+            ref_rows = float(np.mean([sum(len(js) for _, _, js in bt) for bt in tb]))
         tl, tn = 0.0, 0
         for b in loader(views, tb):
             b = to_dev(b, dev)
@@ -90,6 +93,10 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
                 for g in opt.param_groups:
                     g["lr"] = lr * (step + 1) / warm
             loss, _ = model.loss(b)
+            # model.loss is a per-batch mean; batches hold very different row counts and packing groups prefixes
+            # by full-stream cost, so a plain mean weights prefixes by 1/rows(batch), which correlates with
+            # whether the stream is about to end (it biased the stopping probability). Sum / constant instead.
+            loss = loss * ((len(b["o_row"]) if cfg.b2 else len(b["row_b"])) / ref_rows)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -110,7 +117,7 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             torch.save(model.state_dict(), out / "model.pt")
         elif ep - best_ep >= patience:
             break
-    info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep,
+    info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep, "ref_rows": ref_rows,
             "cutoff": cutoff, "params": sum(p.numel() for p in model.parameters()), "history": hist}
     (out / "train.json").write_text(json.dumps(info, indent=1))
     return info

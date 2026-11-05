@@ -100,6 +100,8 @@ class TimeLaw:
         surv = partial + self.tail.gather(1, bf[:, None])[:, 0] + self.atom63
         out = torch.log(torch.clamp(surv, min=1e-300)) - self.logZ
         out = torch.where(b >= 63, torch.log(self.atom63) - self.logZ, out)
+        # 0 < r < 1 s: only the same-second atom lies before t0 + r (bin 1 starts at 1 s)
+        out = torch.where((r > 0) & (r < 1), torch.log(torch.clamp(self.Z - self.atom0, min=1e-300)) - self.logZ, out)
         return torch.where(r <= 0, torch.zeros_like(out), out)
 
     def bin_probs(self) -> torch.Tensor:

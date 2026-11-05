@@ -92,3 +92,11 @@ def test_concentrated_bin_samples_stay_in_bin():
     law = TimeLaw(torch.log_softmax(lp, -1).repeat(1000, 1), None, None, torch.full((1000,), 1_620_000_000.0))
     dt, _ = law.sample(torch.Generator().manual_seed(0))
     assert np.all(dt_bin(dt.numpy()) == 2)
+
+
+def test_subsecond_survival_counts_only_the_same_second_atom():
+    for week in (True, False):
+        law = _law(week=week)
+        r = torch.full((3,), 0.5, dtype=torch.float64)
+        expect = 1 - law.bin_probs()[:, 0]
+        assert torch.allclose(torch.exp(law.log_survival(r)), expect, atol=1e-12)
