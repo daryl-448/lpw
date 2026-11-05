@@ -200,7 +200,7 @@ def collate(views: list[dict], specs: list[tuple[int, np.ndarray]], n_venues: in
     cohort = np.zeros(B, np.int64)
     prof = np.zeros((B, len(views[0]["prof"])), np.float32)
     ocont = np.zeros((B, 6), np.float32)
-    rows = {k: [] for k in ("b", "j", "type", "t0", "r", "tkind")}
+    rows = {k: [] for k in ("b", "j", "type", "t0", "r", "tkind", "nown")}
     orow = {k: [] for k in ("row", "cls", "venue", "ent", "amt", "tcont", "tbin", "tmonth", "thour", "tdow", "led")}
     ent_parts = []
     pmax = 1
@@ -225,6 +225,7 @@ def collate(views: list[dict], specs: list[tuple[int, np.ndarray]], n_venues: in
         ocont[b, 5] = np.log1p(s) / 5.0
         # entries seen before the last scored prefix (every REPEAT target is among them)
         P = int(v["ent"][: s + ne].max()) + 1 if s + ne > 0 else 0
+        n_own = np.concatenate([[0], np.cumsum(v["kind"] != IN_AGENT)])  # owned events before position k, whole stream
         own_ks = []
         for j in js:
             k = s + int(j)
@@ -237,7 +238,7 @@ def collate(views: list[dict], specs: list[tuple[int, np.ndarray]], n_venues: in
             else:
                 typ, tgt_t, tk = 3, float(v["obs_end"]), -1
             ridx = len(rows["b"])
-            for key, val in zip(("b", "j", "type", "t0", "r", "tkind"), (b, int(j), typ, t0, tgt_t - t0, tk)):
+            for key, val in zip(("b", "j", "type", "t0", "r", "tkind", "nown"), (b, int(j), typ, t0, tgt_t - t0, tk, int(n_own[k]))):
                 rows[key].append(val)
             if typ in (0, 1):
                 own_ks.append(k)

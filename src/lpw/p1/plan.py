@@ -11,6 +11,7 @@ latest ones, so a fixed level becomes a random walk. s is a persistent anchor fe
 """
 
 import numpy as np
+import torch
 
 from lpw.p1.store import IN_AGENT
 
@@ -18,6 +19,25 @@ COUNT_EDGES = np.array([0, 1, 2, 3, 5, 10, 30, 100, 300, 1000])  # bucket i is [
 N_PLAN_N = len(COUNT_EDGES)          # 10 count buckets; index N_PLAN_N = unknown
 N_PLAN_A = 6                          # 5 train-quintile amount buckets + "no owned events"; index N_PLAN_A = unknown
 P_DROP = 0.2
+
+
+# plan progress (lpw_plan_prog): where the agent's owned-event count so far, n, sits in its count bucket [lo, hi)
+PROG_BELOW, PROG_ROOM, PROG_DONE, PROG_UNKNOWN = 0, 1, 2, 3  # n < lo | lo <= n < hi - 1 | n >= hi - 1 | s unknown
+N_PROG = 4
+
+
+def progress_state(plan_n: torch.Tensor, n_own: torch.Tensor) -> torch.Tensor:
+    """Per row: PROG_BELOW (the plan needs more owned events), PROG_ROOM (it allows more), PROG_DONE (a further owned
+    event would leave the bucket; with the real plan this only happens when no further owned event follows), or
+    PROG_UNKNOWN when s is unknown. The last bucket is open-ended, so it is never DONE. plan_n is the effective
+    (dropped / unknown-masked) plan of each row's agent; n_own counts owned events before the row's target, from the
+    start of the stream (not the context window)."""
+    edges = torch.as_tensor(np.append(COUNT_EDGES, np.iinfo(np.int64).max), device=plan_n.device)
+    unknown = plan_n == N_PLAN_N
+    k = plan_n.clamp(max=N_PLAN_N - 1)
+    lo, hi = edges[k], edges[k + 1]
+    st = torch.where(n_own < lo, PROG_BELOW, torch.where(n_own >= hi - 1, PROG_DONE, PROG_ROOM))
+    return torch.where(unknown, PROG_UNKNOWN, st)
 
 
 def count_bucket(n: np.ndarray) -> np.ndarray:

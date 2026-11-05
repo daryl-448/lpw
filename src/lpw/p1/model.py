@@ -40,6 +40,7 @@ class Cfg:
     ff: int = 512
     dropout: float = 0.1
     plan: bool = False     # per-agent plan latent through the PROFILE token (lpw.p1.plan)
+    progress: bool = False  # plan progress state -> learned residual on the dormant-atom logit (needs plan)
 
 
 CONFIGS = {
@@ -50,6 +51,7 @@ CONFIGS = {
     "b1": Cfg("b1", enc="gru"),
     "b2": Cfg("b2", k_mix=1, b2=True),
     "lpw_plan": Cfg("lpw_plan", plan=True),
+    "lpw_plan_prog": Cfg("lpw_plan_prog", plan=True, progress=True),
 }
 
 
@@ -141,6 +143,13 @@ class Model(nn.Module):
             self.e_plan_a = nn.Embedding(N_PLAN_A + 1, d)
             nn.init.zeros_(self.e_plan_n.weight)  # starts as a no-op on a fine-tuned checkpoint
             nn.init.zeros_(self.e_plan_a.weight)
+        if cfg.progress:
+            # Phase 1 diagnosis (runs/p1_diag/drift_results.md): with s through PROFILE only, the plan barely moves
+            # stopping (switching a real count plan "exactly 1" -> "2" changed depth-1 P(stop) by 0.018). This adds a
+            # learned shift to the dormant ("no further owned event") logit of each kind, per progress state.
+            assert cfg.plan, "progress needs the plan latent"
+            from lpw.p1.plan import N_PROG
+            self.prog_dorm = nn.Parameter(torch.zeros(N_PROG, 2))
         # plan latent at inference: False = unknown (NLL evaluation; no future information), True = use B["plan_*"]
         self.plan_inference = False
         self.kind_head = mlp(d, d, 2)
@@ -184,6 +193,7 @@ class Model(nn.Module):
             elif not self.plan_inference:
                 pn, pa = torch.full_like(pn, N_PLAN_N), torch.full_like(pa, N_PLAN_A)
             p = p + self.e_plan_n(pn) + self.e_plan_a(pa)
+            B["_plan_n_eff"] = pn  # the effective plan (same dropout draw) for row_progress
         x = torch.cat([p[:, None], x[:, 1:]], 1)
         L = x.shape[1]
         x = x + self.pos(torch.arange(L, device=x.device))[None]
@@ -195,12 +205,22 @@ class Model(nn.Module):
         return h, h
 
     # ---- heads ---------------------------------------------------------------------------------------------
-    def kind_time(self, hk, ho, t0):
-        """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ)."""
+    def row_progress(self, B):
+        """Plan progress state of every row (plan.progress_state), from the plan encode() used for this batch."""
+        from lpw.p1.plan import progress_state
+        return progress_state(B["_plan_n_eff"][B["row_b"]], B["row_nown"])
+
+    def kind_time(self, hk, ho, t0, prog=None):
+        """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ). prog: row_progress, required for
+        progress models."""
         logpk = torch.log_softmax(self.kind_head(hk), -1)
         n = hk.shape[0]
         inp = torch.cat([ho[:, None].expand(n, 2, -1), self.e_tkind.weight[None].expand(n, 2, -1)], -1)
         out = self.time_head(inp).reshape(2 * n, -1)
+        if self.cfg.progress:
+            assert prog is not None, "progress model: pass prog=model.row_progress(B)"
+            res = self.prog_dorm[prog].reshape(2 * n).to(out.dtype)
+            out = torch.cat([out[:, :63], out[:, 63:64] + res[:, None], out[:, 64:]], 1)
         lp = torch.log_softmax(out[:, :64], -1)
         lh = torch.log_softmax(out[:, 64:88], -1) if self.cfg.week else None
         ld = torch.log_softmax(out[:, 88:95], -1) if self.cfg.week else None
@@ -277,7 +297,7 @@ class Model(nn.Module):
         rb, rj, typ, t0, r = B["row_b"], B["row_j"], B["row_type"], B["row_t0"], B["row_r"]
         N = len(rb)
         hk, ho = Hk[rb, rj], Ho[rb, rj]
-        logpk, law, tout = self.kind_time(hk, ho, t0)
+        logpk, law, tout = self.kind_time(hk, ho, t0, self.row_progress(B) if self.cfg.progress else None)
         own = typ == 1
         cen = (typ == 2) | (typ == 3)
         tk = B["row_tkind"].clamp(min=0)

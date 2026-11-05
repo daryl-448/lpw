@@ -122,7 +122,7 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
     rb, rj, t0 = B["row_b"], B["row_j"], B["row_t0"]
     n = len(rb)
     hk, ho = Hk[rb, rj], Ho[rb, rj]
-    logpk, law, _ = model.kind_time(hk, ho, t0)
+    logpk, law, _ = model.kind_time(hk, ho, t0, model.row_progress(B) if model.cfg.progress else None)
     kappa = torch.multinomial(torch.exp(logpk), 1, generator=g)[:, 0]
     dt2, dorm2 = law.sample(g)
     sel = torch.arange(n, device=rb.device) * 2 + kappa

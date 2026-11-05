@@ -23,7 +23,7 @@ DORMANT = 63
 @torch.no_grad()
 def _cache(model, store, views, dev):
     from lpw.p1.train import loader, to_dev
-    keys = ("hk", "ho", "t0", "r", "typ", "tk", "w")
+    keys = ("hk", "ho", "t0", "r", "typ", "tk", "w", "pg")
     C = {k: [] for k in keys}
     for b in loader(views, pack(exact_specs(store, store.agents("train")), views)):
         b = to_dev(b, dev)
@@ -36,6 +36,7 @@ def _cache(model, store, views, dev):
         C["r"].append(b["row_r"])
         C["typ"].append(b["row_type"].to(torch.int8))
         C["tk"].append(b["row_tkind"].clamp(min=0))
+        C["pg"].append(model.row_progress(b) if model.cfg.progress else torch.zeros(len(rb), device=rb.device, dtype=torch.int64))
         C["w"].append(b["agent_w"][rb].double() if "agent_w" in b else torch.ones(len(rb), device=rb.device, dtype=torch.float64))
     return {k: torch.cat(v) for k, v in C.items()}
 
@@ -44,7 +45,7 @@ def _kind_time_loss(model, C, idx):
     """Per-row kind + time + censoring NLL, the same terms as Model._terms, averaged over rows with the training
     row weights (uniform unless the model was trained with agent weights)."""
     t0, r, typ, tk = C["t0"][idx], C["r"][idx], C["typ"][idx], C["tk"][idx]
-    logpk, law, _ = model.kind_time(C["hk"][idx].float(), C["ho"][idx].float(), t0)
+    logpk, law, _ = model.kind_time(C["hk"][idx].float(), C["ho"][idx].float(), t0, C["pg"][idx] if model.cfg.progress else None)
     n = len(idx)
     r2 = r.repeat_interleave(2)
     logf = law.log_density(r2).view(n, 2)

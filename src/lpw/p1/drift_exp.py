@@ -90,8 +90,11 @@ for ro, nm in ((0, "normal"), (1, "scam")):
     res[f"real_{nm}"] = readouts(real_streams, m)
     res[f"syn_{nm}"] = readouts(syn_streams, m)
     if plans:
-        comp = [np.mean(np.abs(count_bucket(np.array([len(s[0]) for s in S]))[m] - p[m]) <= 1) for S, p in zip(syn_streams, plans)]
-        res[f"compliance_{nm}"] = float(np.mean(comp))
+        diff = [count_bucket(np.array([len(s[0]) for s in S]))[m] - p[m] for S, p in zip(syn_streams, plans)]
+        res[f"compliance_{nm}"] = float(np.mean([np.mean(np.abs(d) <= 1) for d in diff]))
+        res[f"plan_exact_{nm}"] = float(np.mean([np.mean(d == 0) for d in diff]))
+        res[f"plan_under_{nm}"] = float(np.mean([np.mean(d < 0) for d in diff]))
+        res[f"plan_over_{nm}"] = float(np.mean([np.mean(d > 0) for d in diff]))
 fid = average_fidelity([compare(real, Sample(ag_, e_, st.w_start), groups, paired=True) for ag_, e_ in reps])
 failing = lambda f: [k for k, v in f.items() if isinstance(v, dict) and "pass_freq" in v and v["pass_freq"] < 0.5]
 ratios = lambda f: {k: v["ratio_mean"] for k, v in f.items() if isinstance(v, dict) and "ratio_mean" in v}

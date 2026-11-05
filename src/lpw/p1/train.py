@@ -131,9 +131,14 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             tl += loss.item()
             tn += 1
         vl, vplain = val_loss(model, views, vb, dev)
+        vknown = None
+        if cfg.plan:  # selection uses s unknown (no future information); also track the known-s branch generation uses
+            model.plan_inference = True
+            vknown = val_loss(model, views, vb, dev)[1]
+            model.plan_inference = False
         if step >= warm:
             sched.step(vl)
-        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "val_plain": vplain, "lr": opt.param_groups[0]["lr"],
+        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "val_plain": vplain, "val_known_s": vknown, "lr": opt.param_groups[0]["lr"],
                      "sec": round(time.time() - t, 1), "steps": step})
         log(f"[{model_name}] ep {ep} train {tl / max(tn, 1):.4f} val {vl:.4f} plain {vplain:.4f} ({time.time() - t:.0f}s)")
         if vl < best - 1e-4:
