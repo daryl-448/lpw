@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from lpw.p1.batch import Views, collate_specs, pack, train_specs, val_specs
+from lpw.p1.batch import Views, agent_weights, collate_specs, pack, train_specs, val_specs
 from lpw.p1.model import CONFIGS, Model
 from lpw.p1.store import build_store
 
@@ -38,16 +38,26 @@ def to_dev(b, dev):
 
 
 @torch.no_grad()
-def val_loss(model, views, batches, dev) -> float:
+def val_loss(model, views, batches, dev) -> tuple[float, float]:
+    """(selection loss, plain per-prefix NLL). They differ only with agent weights in views: the selection loss is
+    then the agent-weighted mean, the same objective as training."""
     model.eval()
-    tot, n = 0.0, 0
+    tot, n, tot_w, n_w = 0.0, 0, 0.0, 0.0
     for b in loader(views, batches):
         b = to_dev(b, dev)
         loss, t = model.loss(b)
-        w = len(b["o_row"]) if model.cfg.b2 else len(b["row_b"])
-        tot += loss.item() * w
-        n += w
-    return tot / max(n, 1)
+        if model.cfg.b2:
+            w = len(b["o_row"])
+            tot += loss.item() * w
+            n += w
+            continue
+        rows = len(b["row_b"])
+        tot += (t["kind"].sum() + t["time"].sum() + t["cens"].sum() + t["cp"].sum() + t["amt"].sum()).item()
+        n += rows
+        tot_w += loss.item() * rows
+        n_w += b["agent_w"][b["row_b"]].sum().item() if "agent_w" in b else rows
+    plain = tot / max(n, 1)
+    return (plain if model.cfg.b2 else tot_w / max(n_w, 1e-12)), plain
 
 
 def cutoff_ts(store, months: int) -> int:
@@ -58,8 +68,10 @@ def cutoff_ts(store, months: int) -> int:
 
 
 def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, patience=6, lr=1e-3, cutoff_months=0,
-          dev="cuda", log=print, init: Path | None = None, warm: int = 300) -> dict:
-    """init: fine-tune from this checkpoint (missing parameters, e.g. a new plan embedding, keep their init)."""
+          dev="cuda", log=print, init: Path | None = None, warm: int = 300, agent_alpha: float = 0.0) -> dict:
+    """init: fine-tune from this checkpoint (missing parameters, e.g. a new plan embedding, keep their init).
+    agent_alpha: weight each prefix by (rows of its agent)^-agent_alpha (batch.agent_weights) in the training loss,
+    the early-stopping loss and the stop recalibration; 0 = the plain likelihood."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
@@ -68,8 +80,9 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     if cutoff_months:
         cutoff = cutoff_ts(store, cutoff_months)
         store = build_store(pilot, cutoff=cutoff)
-    views = Views(store)
     cfg = CONFIGS[model_name]
+    assert not (agent_alpha and cfg.b2), "agent weighting is not defined for B2"
+    views = Views(store, agent_weights(store, agent_alpha) if agent_alpha else None)
     model = Model(cfg, store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
     if init is not None:
         missing, unexpected = model.load_state_dict(torch.load(init, map_location=dev), strict=False)
@@ -104,6 +117,8 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             # whether the stream is about to end (it biased the stopping probability). Sum / constant instead.
             scale = (len(b["o_row"]) if cfg.b2 else len(b["row_b"])) / ref_rows
             loss = loss * scale
+            if "agent_w" in b:  # the batch's total weight replaces its row count in the clip threshold
+                scale = b["agent_w"][b["row_b"]].sum().item() / ref_rows
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -115,19 +130,19 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
             step += 1
             tl += loss.item()
             tn += 1
-        vl = val_loss(model, views, vb, dev)
+        vl, vplain = val_loss(model, views, vb, dev)
         if step >= warm:
             sched.step(vl)
-        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "lr": opt.param_groups[0]["lr"],
+        hist.append({"epoch": ep, "train": tl / max(tn, 1), "val": vl, "val_plain": vplain, "lr": opt.param_groups[0]["lr"],
                      "sec": round(time.time() - t, 1), "steps": step})
-        log(f"[{model_name}] ep {ep} train {tl / max(tn, 1):.4f} val {vl:.4f} ({time.time() - t:.0f}s)")
+        log(f"[{model_name}] ep {ep} train {tl / max(tn, 1):.4f} val {vl:.4f} plain {vplain:.4f} ({time.time() - t:.0f}s)")
         if vl < best - 1e-4:
             best, best_ep = vl, ep
             torch.save(model.state_dict(), out / "model.pt")
         elif ep - best_ep >= patience:
             break
     info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep, "ref_rows": ref_rows,
-            "init": str(init) if init else None, "lr": lr,
+            "init": str(init) if init else None, "lr": lr, "agent_alpha": agent_alpha,
             "cutoff": cutoff, "params": sum(p.numel() for p in model.parameters()), "history": hist}
     (out / "train.json").write_text(json.dumps(info, indent=1))
     from lpw.p1.recal import ensure_recalibrated
@@ -154,9 +169,10 @@ def main():
     ap.add_argument("--init", default=None, help="fine-tune from this checkpoint")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--warm", type=int, default=300)
+    ap.add_argument("--agent-alpha", type=float, default=0.0, help="prefix weight (rows of agent)^-alpha; 0 = plain")
     a = ap.parse_args()
     train(Path(a.pilot), a.model, Path(a.out), seed=a.seed, epochs=a.epochs, cutoff_months=a.cutoff_months,
-          init=Path(a.init) if a.init else None, lr=a.lr, warm=a.warm)
+          init=Path(a.init) if a.init else None, lr=a.lr, warm=a.warm, agent_alpha=a.agent_alpha)
 
 
 if __name__ == "__main__":

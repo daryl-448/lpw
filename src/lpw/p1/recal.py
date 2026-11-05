@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from lpw.p1.batch import Views, exact_specs, pack
+from lpw.p1.batch import Views, agent_weights, exact_specs, pack
 
 DORMANT = 63
 
@@ -23,7 +23,7 @@ DORMANT = 63
 @torch.no_grad()
 def _cache(model, store, views, dev):
     from lpw.p1.train import loader, to_dev
-    keys = ("hk", "ho", "t0", "r", "typ", "tk")
+    keys = ("hk", "ho", "t0", "r", "typ", "tk", "w")
     C = {k: [] for k in keys}
     for b in loader(views, pack(exact_specs(store, store.agents("train")), views)):
         b = to_dev(b, dev)
@@ -36,11 +36,13 @@ def _cache(model, store, views, dev):
         C["r"].append(b["row_r"])
         C["typ"].append(b["row_type"].to(torch.int8))
         C["tk"].append(b["row_tkind"].clamp(min=0))
+        C["w"].append(b["agent_w"][rb].double() if "agent_w" in b else torch.ones(len(rb), device=rb.device, dtype=torch.float64))
     return {k: torch.cat(v) for k, v in C.items()}
 
 
 def _kind_time_loss(model, C, idx):
-    """Per-row kind + time + censoring NLL, the same terms as Model._terms, averaged uniformly over rows."""
+    """Per-row kind + time + censoring NLL, the same terms as Model._terms, averaged over rows with the training
+    row weights (uniform unless the model was trained with agent weights)."""
     t0, r, typ, tk = C["t0"][idx], C["r"][idx], C["typ"][idx], C["tk"][idx]
     logpk, law, _ = model.kind_time(C["hk"][idx].float(), C["ho"][idx].float(), t0)
     n = len(idx)
@@ -50,7 +52,7 @@ def _kind_time_loss(model, C, idx):
     own, cen = typ == 1, (typ == 2) | (typ == 3)
     l = torch.where(own, -logpk.gather(1, tk[:, None])[:, 0].double() - logf.gather(1, tk[:, None])[:, 0], 0.0)
     l = l + torch.where(cen, -torch.logsumexp(logpk.double() + logS, -1), 0.0)
-    return l.mean()
+    return (C["w"][idx] * l).mean()  # unbiased for the weighted objective: the weights average 1 over training rows
 
 
 @torch.no_grad()
@@ -60,16 +62,18 @@ def _full_loss(model, C, dev, chunk=16384):
     for i in range(0, n, chunk):
         idx = torch.arange(i, min(i + chunk, n), device=dev)
         tot += _kind_time_loss(model, C, idx).item() * len(idx)
-    return tot / n
+    return tot / C["w"].sum().item()
 
 
-def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, batch_rows=8192, seed=0, log=print) -> dict:
-    """Refit the dormant-atom output row of model.time_head on the training split, in place. Returns a summary."""
+def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, batch_rows=8192, seed=0, log=print,
+                     agent_alpha: float = 0.0) -> dict:
+    """Refit the dormant-atom output row of model.time_head on the training split, in place, with the training row
+    weights (agent_alpha, as in train). Returns a summary."""
     if model.cfg.b2:
         return {"skipped": "b2"}
     model.eval()
     model.plan_inference = model.cfg.plan  # plan models generate with s known, so recalibrate with the real (train) s
-    views = views or Views(store)
+    views = views or Views(store, agent_weights(store, agent_alpha) if agent_alpha else None)
     C = _cache(model, store, views, dev)
     model.plan_inference = False
     last = model.time_head[2]
@@ -99,7 +103,7 @@ def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, 
     assert torch.equal(last.weight.detach()[:DORMANT], w0[0][:DORMANT]) and torch.equal(last.bias.detach()[DORMANT + 1:], w0[1][DORMANT + 1:])
     for p, q in req.items():
         p.requires_grad_(q)
-    info = {"rows": n, "steps": steps, "train_loss_before": before, "train_loss_after": after, "rows_changed": moved}
+    info = {"rows": n, "steps": steps, "agent_alpha": agent_alpha, "train_loss_before": before, "train_loss_after": after, "rows_changed": moved}
     log(f"  stop recalibration: kind+time+cens train NLL {before:.4f} -> {after:.4f} over {n} prefixes")
     return info
 
@@ -119,7 +123,9 @@ def ensure_recalibrated(pilot: Path, model_name: str, out: Path, cutoff_months=0
     if not (out / "model_raw.pt").exists():
         torch.save(model.state_dict(), out / "model_raw.pt")
     log(f"recalibrate {model_name} ({out})")
-    info = recalibrate_stop(model, store, dev=dev, log=log)
+    tj = out / "train.json"
+    alpha = json.loads(tj.read_text()).get("agent_alpha", 0.0) if tj.exists() else 0.0
+    info = recalibrate_stop(model, store, dev=dev, log=log, agent_alpha=alpha)
     torch.save(model.state_dict(), out / "model.pt")
     marker.write_text(json.dumps(info, indent=1))
     return info

@@ -28,8 +28,9 @@ N_TIME_CONT = 5
 class Views:
     """Cached per-agent views of a store, with derived fields."""
 
-    def __init__(self, store):
+    def __init__(self, store, agent_w: np.ndarray | None = None):
         self.store = store
+        self.agent_w = agent_w  # optional per-agent loss weight (agent_weights), passed to batches as "agent_w"
         self.cache: dict[int, dict] = {}
         nonrep = (store.cls != REPEAT).astype(np.int64)
         self.first_cum = np.concatenate([[0], np.cumsum(nonrep)])
@@ -45,6 +46,20 @@ class Views:
     def n_entries_before(self, a: int, m: int) -> int:
         o = self.store.off[a]
         return int(self.first_cum[o + m] - self.first_cum[o])
+
+
+def agent_weights(store, alpha: float) -> np.ndarray:
+    """Per-agent loss weight w_a ∝ (rows of agent a)^-alpha, normalised so the mean weight over training rows is 1.
+    An agent has n_events + 1 scored prefixes. alpha = 0: every prefix counts once (the plain likelihood);
+    alpha = 1: every agent carries the same total weight. Phase 1 diagnosis (runs/p1_diag/drift_results.md): with
+    alpha = 0 the loss and early stopping are dominated by deep prefixes of the few long streams, while most agents
+    are short and the fidelity metrics weight agents, and free-running generation stopped too early at shallow depth."""
+    n = np.diff(store.off).astype(np.float64) + 1.0
+    has_rows = store.origin < store.obs_end
+    w = n ** -alpha
+    tr = (store.split == "train") & has_rows
+    w *= n[tr].sum() / (n[tr] * w[tr]).sum()
+    return np.where(has_rows, w, 0.0).astype(np.float32)
 
 
 def train_specs(store, agents, rng) -> list[tuple[int, int, np.ndarray]]:
@@ -286,4 +301,7 @@ def to_torch(batch: dict, dev) -> dict:
 
 def collate_specs(views: Views, specs) -> dict:
     st = views.store
-    return collate([views(a) for a, _, _ in specs], [(s, js) for _, s, js in specs], st.n_venues, st.w_start)
+    out = collate([views(a) for a, _, _ in specs], [(s, js) for _, s, js in specs], st.n_venues, st.w_start)
+    if views.agent_w is not None:
+        out["agent_w"] = views.agent_w[np.array([a for a, _, _ in specs], np.int64)]
+    return out

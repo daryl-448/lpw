@@ -403,5 +403,9 @@ class Model(nn.Module):
         n = len(B["row_b"])
         if self.cfg.b2:
             return t["b2_train"].sum() / max(len(B["o_row"]), 1), t
-        tot = t["kind"].sum() + t["time"].sum() + t["cens"].sum() + t["cp"].sum() + t["amt"].sum()
+        if "agent_w" in B:  # agent-balanced weighting (batch.agent_weights); still divided by the row count
+            w = B["agent_w"].double()[B["row_b"]]
+            tot = (w * (t["kind"] + t["time"] + t["cens"])).sum() + (w[t["o_row"]] * (t["cp"] + t["amt"])).sum()
+        else:
+            tot = t["kind"].sum() + t["time"].sum() + t["cens"].sum() + t["cp"].sum() + t["amt"].sum()
         return (tot / n).float(), t
