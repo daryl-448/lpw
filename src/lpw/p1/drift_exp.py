@@ -18,6 +18,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", required=True); ap.add_argument("--model", default="lpw"); ap.add_argument("--mode", default="none")
 ap.add_argument("--out", required=True); ap.add_argument("--pilot", default="data/pilot_2018"); ap.add_argument("--seeds", type=int, default=5)
 ap.add_argument("--no-nll", action="store_true")
+ap.add_argument("--cuts", default="5", help="comma list of k: M-pass with both sides cut to the first k events")
+ap.add_argument("--save", default=None, help="write the synthetic replicas to this parquet")
 a = ap.parse_args()
 t_start = time.time()
 pilot = Path(a.pilot); st = build_store(pilot); views = Views(st)
@@ -91,13 +93,22 @@ for ro, nm in ((0, "normal"), (1, "scam")):
         comp = [np.mean(np.abs(count_bucket(np.array([len(s[0]) for s in S]))[m] - p[m]) <= 1) for S, p in zip(syn_streams, plans)]
         res[f"compliance_{nm}"] = float(np.mean(comp))
 fid = average_fidelity([compare(real, Sample(ag_, e_, st.w_start), groups, paired=True) for ag_, e_ in reps])
-real5 = Sample(rag, cut(rev, 5), st.w_start)
-fid5 = average_fidelity([compare(real5, Sample(ag_, cut(e_, 5), st.w_start), groups, paired=True) for ag_, e_ in reps])
+failing = lambda f: [k for k, v in f.items() if isinstance(v, dict) and "pass_freq" in v and v["pass_freq"] < 0.5]
+ratios = lambda f: {k: v["ratio_mean"] for k, v in f.items() if isinstance(v, dict) and "ratio_mean" in v}
 for g in ("normal", "scam"):
     res[f"mpass_{g}"] = (fid[g]["pass_rate"], fid[g]["pass_rate_sd"])
-    res[f"mpass5_{g}"] = (fid5[g]["pass_rate"], fid5[g]["pass_rate_sd"])
-    res[f"failing_{g}"] = [k for k, v in fid[g].items() if isinstance(v, dict) and "pass_freq" in v and v["pass_freq"] < 0.5]
-    res[f"failing5_{g}"] = [k for k, v in fid5[g].items() if isinstance(v, dict) and "pass_freq" in v and v["pass_freq"] < 0.5]
+    res[f"failing_{g}"] = failing(fid[g])
+    res[f"ratio_{g}"] = ratios(fid[g])
+for k in (int(x) for x in a.cuts.split(",")):
+    realk = Sample(rag, cut(rev, k), st.w_start)
+    fidk = average_fidelity([compare(realk, Sample(ag_, cut(e_, k), st.w_start), groups, paired=True) for ag_, e_ in reps])
+    for g in ("normal", "scam"):
+        res[f"mpass{k}_{g}"] = (fidk[g]["pass_rate"], fidk[g]["pass_rate_sd"])
+        res[f"failing{k}_{g}"] = failing(fidk[g])
+        res[f"ratio{k}_{g}"] = ratios(fidk[g])
+if a.save:
+    from lpw.p1.run import write_replicas
+    write_replicas(reps, Path(a.save))
 if not a.no_nll:
     model.plan_inference = False
     e = evaluate(model, st, "val", views=views)["all"]
