@@ -203,9 +203,9 @@ def _sample_trunc_mog(params, k, g):
 
 
 def _trunc_std_normal(a, b, g):
-    """Exact draw of Z ~ N(0,1) restricted to [a, b], by inverse CDF on the side of the mean the interval lies on
-    (so tail intervals keep their precision). Intervals beyond ~37σ, where Φ underflows, use the exponential tail
-    limit z = edge + E / edge (E ~ Exp(1)), which is exact to O(1/edge²)."""
+    """Draw of Z ~ N(0,1) restricted to [a, b], by inverse CDF on the side of the mean the interval lies on (so tail
+    intervals keep their precision). Intervals more than 30σ out, where Φ nears underflow, use the exponential tail
+    limit z = edge + E / edge with E ~ Exp(1) truncated to the interval, accurate to O(1/edge²)."""
     u = torch.rand(a.shape, dtype=torch.float64, device=a.device, generator=g)
     ln = torch.special.log_ndtr
     # right tail: Z = -Φ^-1(p) with p uniform on [Φ(-b), Φ(-a)]; left tail and middle: Z = Φ^-1(p), p on [Φ(a), Φ(b)]
@@ -215,11 +215,12 @@ def _trunc_std_normal(a, b, g):
     lp = hi + torch.log1p(-u * (1 - torch.exp(torch.clamp(lo - hi, max=0.0))))  # log(P_hi − u·(P_hi − P_lo)), P = Φ
     z = torch.special.ndtri(torch.exp(lp).clamp(min=1e-300, max=1 - 1e-16))
     z = torch.where(flip, -z, z)
-    edge = torch.where(flip, a, -b)
-    far = (edge > 37) & ((flip & (a > 37)) | (~flip & (b < -37)))
-    e = -torch.log(torch.clamp(torch.rand(a.shape, dtype=torch.float64, device=a.device, generator=g), min=1e-300))
-    zt = torch.where(flip, a + e / a.clamp(min=1.0), b - e / (-b).clamp(min=1.0))
-    z = torch.where(far, zt, z)
+    edge = torch.where(flip, a, -b).clamp(min=1.0)  # distance of the near endpoint from the mean
+    width = (b - a).clamp(max=1e300)
+    far = torch.where(flip, a, -b) > 30
+    u2 = torch.rand(a.shape, dtype=torch.float64, device=a.device, generator=g)
+    e = -torch.log1p(-u2 * -torch.expm1(-edge * width))  # Exp(1) truncated to [0, edge·width]
+    z = torch.where(far, torch.where(flip, a + e / edge, b - e / edge), z)
     return torch.minimum(torch.maximum(z, a), b)
 
 

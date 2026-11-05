@@ -59,10 +59,19 @@ def test_far_tail_mixture_still_integrates_to_one():
     assert abs(total.item() - 1) < 1e-3
 
 
+def test_far_tail_mass_has_finite_gradients():
+    # a component far above supply next to a healthy one: likelihood and gradients must both be finite
+    k = 2
+    p = torch.tensor([[0.0, 0.0, 10.0, 0.5, -1.5, 0.0]], requires_grad=True)
+    lp = trunc_mog_logpdf(p, torch.tensor([0.3]), k)
+    lp.sum().backward()
+    assert torch.isfinite(lp).all() and torch.isfinite(p.grad).all()
+
+
 def test_tail_sampling_respects_the_interval():
     from lpw.p1.generate import _trunc_std_normal
     g = torch.Generator().manual_seed(3)
-    for a, b in [(30.0, 40.0), (-40.0, -30.0), (100.0, 200.0), (-1.0, 2.0)]:
+    for a, b in [(30.0, 40.0), (37.0, 40.0), (-40.0, -30.0), (100.0, 200.0), (-1.0, 2.0)]:
         z = _trunc_std_normal(torch.full((5000,), a, dtype=torch.float64), torch.full((5000,), b, dtype=torch.float64), g)
         assert z.min() >= a and z.max() <= b
         if a > 0:  # exponential-tail mean ≈ a + 1/a

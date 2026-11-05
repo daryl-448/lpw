@@ -5,6 +5,10 @@ Usage: uv run python -m lpw.p1.run --pilot data/pilot --tag 2021 --split val
 
 Steps: train every model (early stop on val), exact next-event evaluation, profile generator, paired and
 unconditional generation, M1–M16 with noise floors, role-signal parity, temporal check, exit criteria.
+
+Generation is stochastic and one sample's M-pass rate moves by up to ±0.2 between seeds, so every generated
+population is drawn --gen-seeds times (as replicas inside one generate call) and fidelity and parity are averaged
+over the replicas; the exit criteria use the averages.
 """
 
 import argparse
@@ -36,6 +40,8 @@ def main():
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--no-temporal", action="store_true")
+    ap.add_argument("--gen-seeds", type=int, default=5)
+    ap.add_argument("--reuse-nll", action="store_true", help="reuse NLL and temporal results from an existing results file")
     a = ap.parse_args()
     pilot, root = Path(a.pilot), Path("runs/p1") / a.tag
     root.mkdir(parents=True, exist_ok=True)
@@ -50,7 +56,18 @@ def main():
     models = a.models.split(",")
     store = build_store(pilot)
     views = Views(store)
-    res = {"pilot": str(pilot), "split": a.split, "nll": {}, "fidelity": {}, "parity": {}, "gen_info": {}}
+    res = {"pilot": str(pilot), "split": a.split, "gen_seeds": a.gen_seeds, "nll": {}, "fidelity": {}, "parity": {}, "gen_info": {}}
+    prev, prev_mtime = {}, 0.0
+    rf = root / f"results_{a.split}.json"
+    if a.reuse_nll and rf.exists():
+        prev, prev_mtime = json.loads(rf.read_text()), rf.stat().st_mtime
+        if prev.get("pilot") != str(pilot):
+            prev = {}
+
+    def reusable(*ckpts):
+        """Only results computed after every checkpoint they depend on was written (the evaluator code itself is
+        the caller's responsibility when passing --reuse-nll)."""
+        return all((root / c / "model.pt").exists() and (root / c / "model.pt").stat().st_mtime < prev_mtime for c in ckpts)
 
     for m in models:
         if not (root / m / "model.pt").exists():
@@ -58,6 +75,10 @@ def main():
             info = train(pilot, m, root / m, epochs=a.epochs, log=log)
             log(f"  {m}: best val {info['best_val']:.4f} at epoch {info['best_epoch']}")
     for m in models:
+        if m in prev.get("nll", {}) and reusable(m):
+            res["nll"][m] = prev["nll"][m]
+            log(f"eval {m}: reused full {res['nll'][m]['all']['nll_full']:.4f} shared {res['nll'][m]['all']['nll_shared']:.4f}")
+            continue
         model = load(pilot, m, root / m, store)
         t = time.time()
         res["nll"][m] = evaluate(model, store, a.split, views=views)
@@ -84,36 +105,47 @@ def main():
             continue
         model = load(pilot, m, root / m, store)
         t = time.time()
-        (sag, sev), info = generate(model, conds, store, log=log)
-        sev.write_parquet(root / f"gen_{m}_{a.split}_paired.parquet")
-        res["gen_info"][f"{m}/paired"] = {**info, "events": sev.height, "real_events": rev.height, "sec": round(time.time() - t)}
-        syn = Sample(sag, sev, store.w_start)
-        res["fidelity"][f"{m}/paired"] = compare(real, syn, groups, paired=True)
-        res["parity"][f"{m}/paired"] = role_parity(train_X, train_y, real_X, real_y,
-                                                   agent_table(syn, np.stack([c["prof"] for c in conds])), real_y)
+        reps, info = generate_replicas(model, [conds] * a.gen_seeds, store, seed=7, log=log)
+        write_replicas(reps, root / f"gen_{m}_{a.split}_paired.parquet")
+        res["gen_info"][f"{m}/paired"] = {**info, "events": [e.height for _, e in reps], "real_events": rev.height,
+                                         "sec": round(time.time() - t)}
+        prof = np.stack([c["prof"] for c in conds])
+        fids, pars = [], []
+        for sag, sev in reps:
+            syn = Sample(sag, sev, store.w_start)
+            fids.append(compare(real, syn, groups, paired=True))
+            pars.append(role_parity(train_X, train_y, real_X, real_y, agent_table(syn, prof), real_y))
+        res["fidelity"][f"{m}/paired"] = average_fidelity(fids)
+        res["parity"][f"{m}/paired"] = average_parity(pars)
         fr = res["fidelity"][f"{m}/paired"]
-        log(f"gen {m}: {sev.height} events vs {rev.height} real ({time.time() - t:.0f}s); pass normal {fr['normal']['pass_rate']:.2f} "
-            f"scam {fr['scam']['pass_rate']:.2f}; parity {res['parity'][f'{m}/paired']}")
+        log(f"gen {m}: {np.mean(res['gen_info'][f'{m}/paired']['events']):.0f} events/seed vs {rev.height} real ({time.time() - t:.0f}s); "
+            f"pass normal {fr['normal']['pass_rate']:.2f}±{fr['normal']['pass_rate_sd']:.2f} scam {fr['scam']['pass_rate']:.2f}"
+            f"±{fr['scam']['pass_rate_sd']:.2f}; parity delta {res['parity'][f'{m}/paired']['delta']:+.3f}")
 
     if "lpw" in models:
         pg = ProfileGen(store, log=log)
         rng = np.random.default_rng(11)
         roles = store.role[agents]
-        uconds = pg.population(roles, rng)
+        upops = [pg.population(roles, rng) for _ in range(a.gen_seeds)]
         model = load(pilot, "lpw", root / "lpw", store)
-        (uag, uev), info = generate(model, uconds, store, seed=13, log=log)
-        uev.write_parquet(root / f"gen_lpw_{a.split}_uncond.parquet")
-        res["gen_info"]["lpw/uncond"] = {**info, "events": uev.height}
-        usyn = Sample(uag, uev, store.w_start)
-        ug = groups_for(uag, age_edges)
-        res["fidelity"]["lpw/uncond"] = compare(real, usyn, groups, paired=False, synth_groups=ug)
-        res["parity"]["lpw/uncond"] = role_parity(train_X, train_y, real_X, real_y,
-                                                  agent_table(usyn, np.stack([c["prof"] for c in uconds])), roles)
+        reps, info = generate_replicas(model, upops, store, seed=13, log=log)
+        write_replicas(reps, root / f"gen_lpw_{a.split}_uncond.parquet")
+        res["gen_info"]["lpw/uncond"] = {**info, "events": [e.height for _, e in reps]}
+        fids, pars = [], []
+        for (uag, uev), uconds in zip(reps, upops):
+            usyn = Sample(uag, uev, store.w_start)
+            fids.append(compare(real, usyn, groups, paired=False, synth_groups=groups_for(uag, age_edges)))
+            pars.append(role_parity(train_X, train_y, real_X, real_y, agent_table(usyn, np.stack([c["prof"] for c in uconds])), roles))
+        res["fidelity"]["lpw/uncond"] = average_fidelity(fids)
+        res["parity"]["lpw/uncond"] = average_parity(pars)
         res["profile_gen"] = {"val_nll": pg.val_nll, "epochs": pg.epochs}
         fr = res["fidelity"]["lpw/uncond"]
-        log(f"uncond lpw: {uev.height} events; pass normal {fr['normal']['pass_rate']:.2f} scam {fr['scam']['pass_rate']:.2f}")
+        log(f"uncond lpw: {np.mean(res['gen_info']['lpw/uncond']['events']):.0f} events/seed; pass normal {fr['normal']['pass_rate']:.2f}"
+            f"±{fr['normal']['pass_rate_sd']:.2f} scam {fr['scam']['pass_rate']:.2f}±{fr['scam']['pass_rate_sd']:.2f}")
 
-    if "lpw" in models and not a.no_temporal:
+    if "temporal" in prev and reusable("lpw", "lpw_t2"):
+        res["temporal"] = prev["temporal"]
+    elif "lpw" in models and not a.no_temporal:
         tdir = root / "lpw_t2"
         cut = cutoff_ts(store, 2)
         if not (tdir / "model.pt").exists():
@@ -126,6 +158,50 @@ def main():
     res["exit"] = exit_criteria(res)
     (root / f"results_{a.split}.json").write_text(json.dumps(res, indent=1, default=float))
     log(f"exit criteria: {json.dumps(res['exit'])}")
+
+
+def generate_replicas(model, pops: list[list[dict]], store, seed, log):
+    """Generate several populations in one call (they share rounds, so the long tail of a few active streams is not
+    paid once per population). Streams are independent, so replica r is exactly a population drawn on its own."""
+    sizes = [len(p) for p in pops]
+    (ag, ev), info = generate(model, [c for p in pops for c in p], store, seed=seed, log=log)
+    out, lo = [], 0
+    for n in sizes:
+        sel = (pl.col("agent") >= lo) & (pl.col("agent") < lo + n)
+        out.append((ag.filter(sel).with_columns(pl.col("agent") - lo), ev.filter(sel).with_columns(pl.col("agent") - lo)))
+        lo += n
+    return out, info
+
+
+def write_replicas(reps, path: Path):
+    pl.concat([e.with_columns(pl.lit(r, pl.Int16).alias("replica")) for r, (_, e) in enumerate(reps)]).write_parquet(path)
+
+
+def average_fidelity(fids: list[dict]) -> dict:
+    """Per group: mean and sd of the pass rate over replicas, each metric's pass frequency and mean synth/floor
+    ratio, and the per-replica results."""
+    out = {}
+    for g in fids[0]:
+        rates = [f[g]["pass_rate"] for f in fids]
+        mets = {}
+        for mid in fids[0][g]:
+            if not isinstance(fids[0][g][mid], dict):
+                continue
+            mets[mid] = {"pass_freq": float(np.mean([f[g][mid]["pass"] for f in fids])),
+                         "ratio_mean": float(np.mean([f[g][mid]["ratio"] for f in fids])),
+                         "majority_pass": bool(np.mean([f[g][mid]["pass"] for f in fids]) > 0.5)}
+        out[g] = {**mets, "pass_rate": float(np.mean(rates)), "pass_rate_sd": float(np.std(rates)),
+                  "pass_rates": rates, "n_real": fids[0][g]["n_real"], "n_synth": fids[0][g]["n_synth"],
+                  "replicas": [f[g] for f in fids]}
+    return out
+
+
+def average_parity(pars: list[dict]) -> dict:
+    """Passes when the mean per-replica |ΔAUC| is within 0.05 (signed deltas could cancel across replicas)."""
+    d = np.array([p["delta"] for p in pars])
+    return {"auc_real": pars[0]["auc_real"], "auc_synth": float(np.mean([p["auc_synth"] for p in pars])),
+            "delta": float(d.mean()), "delta_sd": float(d.std()), "abs_delta_mean": float(np.abs(d).mean()),
+            "pass": bool(np.abs(d).mean() <= 0.05), "replicas": pars}
 
 
 def exit_criteria(res) -> dict:

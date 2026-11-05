@@ -68,13 +68,13 @@ def phi(count, rec, tin, tout, tier, in_ctx):
 
 
 def log_interval_mass(a, b):
-    """log(Φ(b) − Φ(a)) for a < b, stable in both tails: an interval entirely right of the mean is computed as
-    Φ(−a) − Φ(−b), one entirely left as Φ(b) − Φ(a), each as log Φ(x) + log1p(−exp(log Φ(y) − log Φ(x)))."""
+    """log(Φ(b) − Φ(a)) for standardized bounds a < b that are not arbitrarily close (amount intervals are at least
+    ~1.6σ wide). An interval right of the mean is reflected to [−b, −a] first, so the single expression
+    log Φ(hi) + log1p(−exp(log Φ(lo) − log Φ(hi))) never cancels and no unselected branch can poison gradients."""
     ln = torch.special.log_ndtr
-    right = ln(-a) + torch.log1p(-torch.exp(torch.clamp(ln(-b) - ln(-a), max=0.0)))
-    left = ln(b) + torch.log1p(-torch.exp(torch.clamp(ln(a) - ln(b), max=0.0)))
-    mid = torch.log1p(-(torch.special.ndtr(a) + torch.special.ndtr(-b)))
-    return torch.where(a > 0, right, torch.where(b < 0, left, mid))
+    flip = a > 0
+    lo, hi = torch.where(flip, -b, a), torch.where(flip, -a, b)
+    return ln(hi) + torch.log1p(-torch.exp(torch.clamp(ln(lo) - ln(hi), max=0.0)))
 
 
 def component_mass(mu, sig):
