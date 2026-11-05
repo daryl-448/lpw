@@ -25,6 +25,7 @@ from lpw.p1.evaluate import evaluate
 from lpw.p1.fidelity import Sample, agent_table, compare, groups_for, real_frames, role_parity
 from lpw.p1.generate import generate
 from lpw.p1.profile_gen import ProfileGen
+from lpw.p1.recal import ensure_recalibrated
 from lpw.p1.store import build_store
 from lpw.p1.train import cutoff_ts, load, train
 
@@ -74,6 +75,7 @@ def main():
             log(f"train {m}")
             info = train(pilot, m, root / m, epochs=a.epochs, log=log)
             log(f"  {m}: best val {info['best_val']:.4f} at epoch {info['best_epoch']}")
+        ensure_recalibrated(pilot, m, root / m, log=log)  # no-op once done; older checkpoints get it here
     for m in models:
         if m in prev.get("nll", {}) and reusable(m):
             res["nll"][m] = prev["nll"][m]
@@ -143,10 +145,12 @@ def main():
         log(f"uncond lpw: {np.mean(res['gen_info']['lpw/uncond']['events']):.0f} events/seed; pass normal {fr['normal']['pass_rate']:.2f}"
             f"±{fr['normal']['pass_rate_sd']:.2f} scam {fr['scam']['pass_rate']:.2f}±{fr['scam']['pass_rate_sd']:.2f}")
 
+    tdir = root / "lpw_t2"
+    if "lpw" in models and not a.no_temporal and (tdir / "model.pt").exists():
+        ensure_recalibrated(pilot, "lpw", tdir, cutoff_months=2, log=log)  # before the reuse check below
     if "temporal" in prev and reusable("lpw", "lpw_t2"):
         res["temporal"] = prev["temporal"]
     elif "lpw" in models and not a.no_temporal:
-        tdir = root / "lpw_t2"
         cut = cutoff_ts(store, 2)
         if not (tdir / "model.pt").exists():
             log("train lpw with a 2-month temporal hold-out")

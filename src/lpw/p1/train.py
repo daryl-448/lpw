@@ -120,6 +120,8 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
     info = {"model": model_name, "pilot": str(pilot), "seed": seed, "best_val": best, "best_epoch": best_ep, "ref_rows": ref_rows,
             "cutoff": cutoff, "params": sum(p.numel() for p in model.parameters()), "history": hist}
     (out / "train.json").write_text(json.dumps(info, indent=1))
+    from lpw.p1.recal import ensure_recalibrated
+    ensure_recalibrated(pilot, model_name, out, cutoff_months=cutoff_months, dev=dev, log=log)
     return info
 
 
