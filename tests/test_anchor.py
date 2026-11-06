@@ -92,3 +92,40 @@ def test_merge_takes_history_fields_and_keeps_targets_clean():
     m = merge_corrupted(clean, cor)
     assert all(m[k] == 2 for k in ("tok_cont", "tok_dtbin", "e_tin", "o_led"))
     assert all(m[k] == 1 for k in ("o_amt", "o_tbin", "row_r", "plan_n"))
+
+
+def _cache(am, n=40, seed=1):
+    from lpw.p1.anchor import build_cache  # noqa: F401  (layout reference)
+    torch.manual_seed(seed)
+    hk, ho, t0, prog, pn, pa = _rows(n)
+    am._capture = {}
+    am.kind_time(hk, ho, t0, prog=prog, anchor=(pn, pa))
+    cap, am._capture = am._capture, None
+    x = torch.randn(n, 512, dtype=torch.float64)
+    with torch.no_grad():
+        ap = am.amt_head(x)
+    return {"logpk": cap["logpk"].detach(), "ho": ho, "out": cap["out"].detach().view(n, 2, -1), "t0": t0,
+            "r": torch.rand(n, dtype=torch.float64) * 1e4 + 1.0, "typ": torch.ones(n, dtype=torch.int8),
+            "tk": torch.randint(0, 2, (n,)), "prog": prog, "pn": pn, "pa": pa, "agent": torch.arange(n) % 5,
+            "own_of_row": torch.arange(n), "x": x, "ap": ap, "amt": torch.randn(n, dtype=torch.float64) - 1.0, "opn": pn, "opa": pa}
+
+
+def test_regularised_fit_keeps_step_zero_without_evaluations():
+    from lpw.p1.anchor import fit_adapters_reg
+    _, am = _models()
+    C = _cache(am)
+    init = {k: v.clone() for k, v in am.anchor.state_dict().items()}
+    info = fit_adapters_reg(am, C, C, max_steps=3, eval_every=10, batch_rows=16, lr=1e-2, log=lambda *a: None)
+    assert info["best_step"] == 0
+    assert all(torch.equal(init[k], v) for k, v in am.anchor.state_dict().items())
+
+
+def test_regularised_fit_restores_the_best_held_out_checkpoint():
+    from lpw.p1.anchor import eval_loss, fit_adapters_reg
+    _, am = _models()
+    Cfit, Chold = _cache(am, seed=1), _cache(am, seed=2)
+    info = fit_adapters_reg(am, Cfit, Chold, Ccor=_cache(am, seed=3), max_steps=40, eval_every=5, batch_rows=16, lr=3e-2,
+                            log=lambda *a: None)
+    hs = [h for _, _, h in info["trace"]]
+    assert info["best_heldout"] == min(hs) <= info["heldout_step0"]
+    assert abs(eval_loss(am, Chold) - info["best_heldout"]) < 1e-9

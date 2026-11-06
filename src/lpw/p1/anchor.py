@@ -121,6 +121,7 @@ class CorruptDS(torch.utils.data.Dataset):
         from lpw.p1.batch import collate, collate_specs
         sp = self.batches[i]
         clean = collate_specs(self.views, sp)
+        clean["spec_agent"] = np.array([a for a, _, _ in sp], np.int64)
         if not self.corrupt:
             return clean
         dts, das = draw_shifts(np.random.default_rng((self.seed, i)), len(sp))
@@ -145,7 +146,7 @@ def build_cache(model, store, agents, corrupt: bool, dev="cuda", seed=0, log=pri
     was = model.plan_inference
     model.eval()
     model.plan_inference = True
-    C = {k: [] for k in ("logpk", "ho", "out", "t0", "r", "typ", "tk", "prog", "pn", "pa", "own", "x", "ap", "amt", "opn", "opa")}
+    C = {k: [] for k in ("logpk", "ho", "out", "t0", "r", "typ", "tk", "prog", "pn", "pa", "agent", "own", "x", "ap", "amt", "opn", "opa")}
     nrow = 0
     try:
         for i, b in enumerate(dl):
@@ -159,6 +160,7 @@ def build_cache(model, store, agents, corrupt: bool, dev="cuda", seed=0, log=pri
             C["logpk"].append(cap["logpk"].float()); C["ho"].append(cap["ho"].half()); C["out"].append(cap["out"].float().view(-1, 2, cap["out"].shape[-1]))  # (N, 2 kinds, 95)
             C["t0"].append(b["row_t0"]); C["r"].append(b["row_r"]); C["typ"].append(b["row_type"].to(torch.int8))
             C["tk"].append(b["row_tkind"].clamp(min=0)); C["prog"].append(model.row_progress(b)); C["pn"].append(pn); C["pa"].append(pa)
+            C["agent"].append(b["spec_agent"][rb])
             oi = t["o_row"]
             C["own"].append(oi + nrow); C["x"].append(cap["amt_x"].half()); C["ap"].append(cap["amt_ap"].float())
             C["amt"].append(b["o_amt"].float()); C["opn"].append(pn[oi]); C["opa"].append(pa[oi])
@@ -237,6 +239,69 @@ def fit_adapters(model, Cc, Ccor=None, steps=1000, batch_rows=4096, lr=3e-4, w_c
     return {"steps": steps, "batch_rows": batch_rows, "lr": lr, "w_cor": w_cor if Ccor is not None else 0.0, "seed": seed, "trace": trace}
 
 
+def fit_adapters_reg(model, Cfit, Chold, Ccor=None, max_steps=4000, eval_every=200, batch_rows=4096, lr=3e-4, wd=0.1,
+                     w_cor=W_COR, cor_alpha=0.5, seed=0, log=print) -> dict:
+    """Regularised fit (re-screen): AdamW (decoupled weight decay) on the adapters only; every eval_every steps the clean
+    held-out-group loss is measured and the best state (step 0 = the untouched base included) is kept. Corrupted
+    auxiliary rows (R) are drawn with probability proportional to n_rows(agent)^-cor_alpha, so a few long streams do not
+    dominate them; clean rows are drawn uniformly (plain MLE)."""
+    params = list(model.anchor.parameters())
+    before = {k: v.detach().clone() for k, v in model.state_dict().items() if not k.startswith("anchor.")}
+    req = {p: p.requires_grad for p in model.parameters()}
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in params:
+        p.requires_grad_(True)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+    dev = Cfit["t0"].device
+    g = torch.Generator(device=dev).manual_seed(seed)
+    if Ccor is not None:
+        _, inv, cnt = torch.unique(Ccor["agent"], return_inverse=True, return_counts=True)
+        pw = cnt[inv].double() ** (-cor_alpha)
+        pw = (pw / pw.sum()).float()
+    best = (eval_loss(model, Chold), 0, {k: v.detach().clone() for k, v in model.anchor.state_dict().items()})
+    trace = [(0, None, best[0])]
+    log(f"  step 0: held-out {best[0]:.4f}")
+    try:
+        for s in range(1, max_steps + 1):
+            ic = torch.randint(0, len(Cfit["t0"]), (batch_rows,), generator=g, device=dev)
+            loss = rows_loss(model, Cfit, ic)
+            if Ccor is not None:
+                ir = torch.multinomial(pw, batch_rows, replacement=True, generator=g)
+                loss = loss + w_cor * rows_loss(model, Ccor, ir)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if s % eval_every == 0:
+                h = eval_loss(model, Chold)
+                trace.append((s, float(loss.detach()), h))
+                log(f"  step {s}: train {float(loss.detach()):.4f} held-out {h:.4f}")
+                if h < best[0]:
+                    best = (h, s, {k: v.detach().clone() for k, v in model.anchor.state_dict().items()})
+    finally:
+        for p, f in req.items():
+            p.requires_grad_(f)
+    model.anchor.load_state_dict(best[2])
+    after = model.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before), "a non-adapter parameter moved"
+    return {"max_steps": max_steps, "eval_every": eval_every, "batch_rows": batch_rows, "lr": lr, "wd": wd,
+            "w_cor": w_cor if Ccor is not None else 0.0, "cor_alpha": cor_alpha, "seed": seed,
+            "best_step": best[1], "best_heldout": best[0], "heldout_step0": trace[0][2], "trace": trace}
+
+
+def split_groups(store, pilot, holdout: float, seed: int = 0):
+    """(fit agents, internal held-out agents): a fixed random share of training GROUPS is held out."""
+    import polars as pl
+    tr = store.agents("train")
+    ag = pl.read_parquet(Path(pilot) / "agents.parquet")
+    gid = dict(zip(ag["node_id"].to_list(), ag["group_id"].to_list()))
+    g = np.array([gid[int(x)] for x in store.node_id[tr]])
+    ug = np.unique(g)
+    hold = np.random.default_rng(seed).choice(ug, int(round(holdout * len(ug))), replace=False)
+    m = np.isin(g, hold)
+    return tr[~m], tr[m]
+
+
 def train_subset(store, pilot, frac: float, seed: int = 0) -> np.ndarray:
     """training agents of a fixed random subset of training groups."""
     import polars as pl
@@ -258,6 +323,45 @@ def load_anchor_model(pilot, base_dir, store, dev="cuda"):
     assert not unexpected and all(k.startswith("anchor.") for k in missing), (missing, unexpected)
     m.eval()
     return m
+
+
+def main_reg():
+    """regularised re-screen (reports/p1_anchor_rescreen.md): arms C and R on all training groups but a fixed 20%
+    internal holdout, AdamW, best held-out checkpoint (step 0 included)."""
+    import argparse
+    from lpw.p1.atomic import atomic_path, write_text
+    from lpw.p1.store import build_store
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pilot", default="data/pilot_2018")
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--arms", default="C,R")
+    ap.add_argument("--holdout", type=float, default=0.2)
+    ap.add_argument("--max-steps", type=int, default=4000)
+    ap.add_argument("--wd", type=float, default=0.1)
+    a = ap.parse_args()
+    pilot, base, root = Path(a.pilot), Path(a.base), Path(a.out)
+    st = build_store(pilot)
+    fit, hold = split_groups(st, pilot, a.holdout)
+    m0 = load_anchor_model(pilot, base, st)
+    print(f"fit {len(fit)} agents, internal holdout {len(hold)} agents ({a.holdout:.0%} of training groups)")
+    Cfit = build_cache(m0, st, fit, corrupt=False)
+    Chold = build_cache(m0, st, hold, corrupt=False)
+    arms = a.arms.split(",")
+    Ccor = build_cache(m0, st, fit, corrupt=True) if "R" in arms else None
+    print(f"cache: fit {len(Cfit['t0'])} rows, holdout {len(Chold['t0'])} rows")
+    for arm in arms:
+        m = load_anchor_model(pilot, base, st)
+        info = fit_adapters_reg(m, Cfit, Chold, Ccor if arm == "R" else None, max_steps=a.max_steps, wd=a.wd)
+        info.update(arm=arm, base=str(base), holdout=a.holdout, fit_agents=int(len(fit)), holdout_agents=int(len(hold)),
+                    holdout_agent_ids=[int(x) for x in hold])
+        out = root / arm
+        out.mkdir(parents=True, exist_ok=True)
+        with atomic_path(out / "model.pt") as t:
+            torch.save(m.state_dict(), t)
+        shutil.copy(base / "train.json", out / "train.json")
+        write_text(out / "anchor.json", json.dumps(info, indent=1))
+        print(f"{arm}: best step {info['best_step']}, held-out {info['heldout_step0']:.4f} -> {info['best_heldout']:.4f}")
 
 
 def main():
@@ -300,4 +404,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--reg" in sys.argv:
+        sys.argv.remove("--reg")
+        main_reg()
+    else:
+        main()
