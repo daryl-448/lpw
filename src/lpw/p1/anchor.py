@@ -156,7 +156,7 @@ def build_cache(model, store, agents, corrupt: bool, dev="cuda", seed=0, log=pri
             rb = b["row_b"]
             n = len(rb)
             pn, pa = b["_plan_n_eff"][rb], b["_plan_a_eff"][rb]
-            C["logpk"].append(cap["logpk"].float()); C["ho"].append(cap["ho"].half()); C["out"].append(cap["out"].float())
+            C["logpk"].append(cap["logpk"].float()); C["ho"].append(cap["ho"].half()); C["out"].append(cap["out"].float().view(-1, 2, cap["out"].shape[-1]))  # (N, 2 kinds, 95)
             C["t0"].append(b["row_t0"]); C["r"].append(b["row_r"]); C["typ"].append(b["row_type"].to(torch.int8))
             C["tk"].append(b["row_tkind"].clamp(min=0)); C["prog"].append(model.row_progress(b)); C["pn"].append(pn); C["pa"].append(pa)
             oi = t["o_row"]
@@ -180,7 +180,7 @@ def rows_loss(model, C, idx):
     from lpw.p1.model import trunc_mog_logpdf
     n = len(idx)
     pn, pa = C["pn"][idx], C["pa"][idx]
-    out = model.anchor.apply_time(C["out"][idx], C["ho"][idx], pn, pa)
+    out = model.anchor.apply_time(C["out"][idx].reshape(2 * n, -1), C["ho"][idx], pn, pa)
     logpk, law, _ = model.time_law(C["logpk"][idx], out, C["t0"][idx], prog=C["prog"][idx])
     r, typ, tk = C["r"][idx], C["typ"][idx], C["tk"][idx]
     r2 = r.repeat_interleave(2)
