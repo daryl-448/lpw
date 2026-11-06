@@ -144,6 +144,7 @@ class Model(nn.Module):
             self.ln = nn.LayerNorm(d)
             if cfg.indep_init:
                 for lay in self.enc.layers:
+                    lay.self_attn.out_proj.reset_parameters()  # _reset_parameters() only zeroes its bias
                     lay.self_attn._reset_parameters()
                     for mod in (lay.linear1, lay.linear2, lay.norm1, lay.norm2):
                         mod.reset_parameters()
@@ -225,7 +226,7 @@ class Model(nn.Module):
         x = torch.cat([p[:, None], x[:, 1:]], 1)
         L = x.shape[1]
         if self.cfg.pos == "alibi" and self.cfg.enc == "tf":
-            h = self.ln(self.enc(x, mask=self.alibi_mask(x.shape[0], L, x.device, x.dtype)))
+            h = self.ln(self.alibi_enc(x))
         elif self.cfg.enc == "tf":
             x = x + self.pos(torch.arange(L, device=x.device))[None]
             mask = nn.Transformer.generate_square_subsequent_mask(L, device=x.device)
@@ -234,6 +235,15 @@ class Model(nn.Module):
             x = x + self.pos(torch.arange(L, device=x.device))[None]
             h = self.ln(self.enc(x)[0])
         return h, h
+
+    def alibi_enc(self, x):
+        """the layers' pre-norm slow path, called directly: nn.TransformerEncoder's fused eval / no-grad fast path
+        treats a float mask as boolean, which would turn the recency penalties into hard exclusions."""
+        mask = self.alibi_mask(x.shape[0], x.shape[1], x.device, x.dtype)
+        for lay in self.enc.layers:
+            x = x + lay._sa_block(lay.norm1(x), mask, None, is_causal=False)
+            x = x + lay._ff_block(lay.norm2(x))
+        return x
 
     def alibi_mask(self, B, L, dev, dtype):
         """(B * heads, L, L) additive mask: causal, -slope_h x (i - j) between event tokens, no penalty on attention to

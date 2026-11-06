@@ -22,18 +22,34 @@ def test_alibi_mask_is_causal_with_unpenalised_profile_and_linear_recency():
 def test_alibi_encoder_is_causal_and_the_bias_is_not_discarded():
     m = _m("tf_alibi")
     x = torch.randn(2, 7, 128)
-    h = m.enc(x, mask=m.alibi_mask(2, 7, "cpu", x.dtype))
+    h = m.alibi_enc(x)
     x2 = x.clone(); x2[:, 4:] = torch.randn(2, 3, 128)
-    h2 = m.enc(x2, mask=m.alibi_mask(2, 7, "cpu", x.dtype))
+    h2 = m.alibi_enc(x2)
     assert torch.allclose(h[:, :4], h2[:, :4], atol=1e-5)
     m.alibi_slopes.zero_()
-    h0 = m.enc(x, mask=m.alibi_mask(2, 7, "cpu", x.dtype))
+    h0 = m.alibi_enc(x)
     assert not torch.allclose(h[:, 3:], h0[:, 3:], atol=1e-4)  # the distance penalty changes the outputs
 
 
 def test_screen_transformers_have_independently_initialised_layers():
-    for n in ("tf_ref", "tf_alibi"):
+    for n in ("tf_ref", "tf_alibi", "tf_small"):
         L = _m(n).enc.layers
         assert not torch.equal(L[0].linear1.weight, L[1].linear1.weight)
         assert not torch.equal(L[0].self_attn.in_proj_weight, L[1].self_attn.in_proj_weight)
+        assert not torch.equal(L[0].self_attn.out_proj.weight, L[1].self_attn.out_proj.weight)
     assert not hasattr(_m("tf_alibi"), "pos")
+
+
+def test_alibi_encode_keeps_soft_penalties_in_eval_no_grad():
+    """the fused eval / no-grad encoder path would turn the additive recency bias into hard exclusions"""
+    m = _m("tf_alibi")
+    x = torch.randn(2, 9, 128)
+    mask = m.alibi_mask(2, 9, "cpu", x.dtype)
+    ref = x
+    for lay in m.enc.layers:  # explicit reference: pre-norm attention with the additive mask, then feed-forward
+        a = lay.norm1(ref)
+        att, _ = lay.self_attn(a, a, a, attn_mask=mask, need_weights=False)
+        ref = ref + att
+        ref = ref + lay.linear2(lay.activation(lay.linear1(lay.norm2(ref))))
+    with torch.no_grad():
+        assert torch.allclose(m.alibi_enc(x), ref, atol=1e-5)

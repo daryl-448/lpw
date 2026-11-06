@@ -201,13 +201,14 @@ def report():
         G[lab] = json.loads((run / "gen_val.json").read_text())
         f = G[lab]["fidelity"]
         R["generation"][lab] = {"run": run.name, "pass_normal": f["normal"]["pass_rate"], "pass_scam": f["scam"]["pass_rate"],
-                                "parity_delta": G[lab]["parity"]["delta"], "capped": G[lab]["capped"],
+                                "parity_delta": G[lab]["parity"]["delta"], "parity_abs_delta_mean": G[lab]["parity"]["abs_delta_mean"],
+                                "capped": G[lab]["capped"],
                                 "ratios": {r: {k: v["ratio_mean"] for k, v in f[r].items() if isinstance(v, dict) and "ratio_mean" in v} for r in ("normal", "scam")}}
         say(f"generation {lab} ({run.name}): pass normal {f['normal']['pass_rate']:.3f} scam {f['scam']['pass_rate']:.3f}, "
-            f"parity delta {G[lab]['parity']['delta']:+.3f}, capped {G[lab]['capped']}")
+            f"parity delta {G[lab]['parity']['delta']:+.3f} (mean |delta| {G[lab]['parity']['abs_delta_mean']:.3f}), capped {G[lab]['capped']}")
     c, rf = R["generation"]["challenger"], R["generation"]["tf_ref"]
     g["G mean M-pass per role not below tf_ref"] = bool(c["pass_normal"] >= rf["pass_normal"] and c["pass_scam"] >= rf["pass_scam"])
-    g["G role-AUC |delta| <= 0.05"] = bool(abs(c["parity_delta"]) <= 0.05)
+    g["G role-AUC mean per-replica |delta| <= 0.05"] = bool(c["parity_abs_delta_mean"] <= 0.05)
     g["G no capped streams"] = c["capped"] == 0
     R["gates"] = g
     say("\ngates:")
