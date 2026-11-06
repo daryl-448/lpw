@@ -5,6 +5,9 @@ on total validation NLL halts before it converges: LPW under-predicted stopping 
 (2018 normal depth 2: 0.235 vs 0.277 observed) although the encoder carries the information (refitting the heads on
 frozen features calibrates it on held-out validation). This stage refits only the time head's dormant-atom output
 row (d + 1 parameters) on the training split, everything else frozen, with every training prefix weighted equally.
+Plan-progress models (cfg.progress) then refit the known-state rows of prog_dorm (3 x 2) with that row frozen, with
+the real s, bounded by PROG_CLAMP; the UNKNOWN row has no rows here (s is always known) and stays as trained, so the
+s-unknown predictions are those of the plain recalibration.
 
 B2 is skipped: it has no censoring term and is not used for generation.
 """
@@ -16,8 +19,11 @@ import numpy as np
 import torch
 
 from lpw.p1.batch import Views, agent_weights, exact_specs, pack
+from lpw.p1.plan import PROG_UNKNOWN
 
 DORMANT = 63
+PROG_LR = 1e-2  # the progress residuals sit near 0 after training (AdamW decay, small share of the loss)
+PROG_CLAMP = 8.0  # |residual| bound: with the real s the BELOW / DONE optima are -inf / +inf
 
 
 @torch.no_grad()
@@ -66,47 +72,107 @@ def _full_loss(model, C, dev, chunk=16384):
     return tot / C["w"].sum().item()
 
 
-def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, batch_rows=8192, seed=0, log=print,
-                     agent_alpha: float = 0.0) -> dict:
-    """Refit the dormant-atom output row of model.time_head on the training split, in place, with the training row
-    weights (agent_alpha, as in train). Returns a summary."""
-    if model.cfg.b2:
-        return {"skipped": "b2"}
-    model.eval()
-    model.plan_inference = model.cfg.plan  # plan models generate with s known, so recalibrate with the real (train) s
-    views = views or Views(store, agent_weights(store, agent_alpha) if agent_alpha else None)
-    C = _cache(model, store, views, dev)
-    model.plan_inference = False
-    last = model.time_head[2]
-    params = [last.weight, last.bias]
-    req = {p: p.requires_grad for p in model.parameters()}
-    for p in model.parameters():
-        p.requires_grad_(False)
-    for p in params:
-        p.requires_grad_(True)
-    keep = torch.zeros(last.out_features, 1, device=last.weight.device)
-    keep[DORMANT] = 1.0
-    opt = torch.optim.Adam(params, lr=lr)  # rows other than the dormant one get zero gradient, so Adam leaves them
-    before = _full_loss(model, C, dev)
-    w0 = (last.weight.detach().clone(), last.bias.detach().clone())
+def clamp_known_progress(prog_dorm: torch.Tensor) -> None:
+    """Bound the known-state progress residuals in place; the UNKNOWN row is never touched."""
+    with torch.no_grad():
+        prog_dorm[:PROG_UNKNOWN].clamp_(-PROG_CLAMP, PROG_CLAMP)
+
+
+def _fit(model, C, dev, params, lr, steps, batch_rows, seed, mask=None, after_step=None, log_every=500):
+    """Adam on the cached rows; mask(param) zeroes the gradient of the elements that must not move. Returns the
+    (step, minibatch loss) trace."""
+    opt = torch.optim.Adam(params, lr=lr)  # fresh, no decay: elements with zero gradient stay exactly as they were
     g = torch.Generator(device=dev).manual_seed(seed)
-    n = len(C["t0"])
-    for _ in range(steps):
+    n, trace = len(C["t0"]), []
+    for step in range(steps):
         idx = torch.randint(0, n, (min(batch_rows, n),), device=dev, generator=g)
         loss = _kind_time_loss(model, C, idx)
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        last.weight.grad.mul_(keep)
-        last.bias.grad.mul_(keep[:, 0])
+        if mask:
+            mask()
         opt.step()
-    after = _full_loss(model, C, dev)
-    moved = int(((last.weight.detach() - w0[0]).abs().sum(1) > 0).sum())
-    assert torch.equal(last.weight.detach()[:DORMANT], w0[0][:DORMANT]) and torch.equal(last.bias.detach()[DORMANT + 1:], w0[1][DORMANT + 1:])
-    for p, q in req.items():
-        p.requires_grad_(q)
-    info = {"rows": n, "steps": steps, "agent_alpha": agent_alpha, "train_loss_before": before, "train_loss_after": after, "rows_changed": moved}
-    log(f"  stop recalibration: kind+time+cens train NLL {before:.4f} -> {after:.4f} over {n} prefixes")
-    return info
+        if after_step:
+            after_step()
+        if step % log_every == 0 or step == steps - 1:
+            trace.append((step, loss.item()))
+    return trace
+
+
+def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, batch_rows=8192, seed=0, log=print,
+                     agent_alpha: float = 0.0, prog_lr: float = PROG_LR) -> dict:
+    """Refit the dormant-atom output row of model.time_head on the training split, in place, with the training row
+    weights (agent_alpha, as in train). A progress model then refits its known-state residuals with that row frozen
+    (a joint fit could trade the shared row against the residuals and so shift the s-unknown predictions; staged,
+    those are exactly those of the first stage). Returns a summary."""
+    if model.cfg.b2:
+        return {"skipped": "b2"}
+    was_inference, req = model.plan_inference, {p: p.requires_grad for p in model.parameters()}
+    model.eval()
+    try:
+        model.plan_inference = model.cfg.plan  # plan models generate with s known, so recalibrate with the real s
+        views = views or Views(store, agent_weights(store, agent_alpha) if agent_alpha else None)
+        C = _cache(model, store, views, dev)
+        model.plan_inference = False
+        for p in model.parameters():
+            p.requires_grad_(False)
+        last = model.time_head[2]
+        state0 = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        before = _full_loss(model, C, dev)
+        n = len(C["t0"])
+        keep = torch.zeros(last.out_features, 1, device=last.weight.device)
+        keep[DORMANT] = 1.0
+
+        def mask_row():
+            last.weight.grad.mul_(keep)
+            last.bias.grad.mul_(keep[:, 0])
+
+        last.weight.requires_grad_(True)
+        last.bias.requires_grad_(True)
+        trace = _fit(model, C, dev, [last.weight, last.bias], lr, steps, batch_rows, seed, mask=mask_row)
+        last.weight.requires_grad_(False)
+        last.bias.requires_grad_(False)
+        mid = _full_loss(model, C, dev)
+        info = {"rows": n, "steps": steps, "agent_alpha": agent_alpha, "train_loss_before": before, "train_loss_after": mid,
+                "trace": trace}
+        log(f"  stop recalibration: kind+time+cens train NLL {before:.4f} -> {mid:.4f} over {n} prefixes")
+        allowed = {"time_head.2.weight", "time_head.2.bias"}
+        if model.cfg.progress:
+            assert not (C["pg"] == PROG_UNKNOWN).any()
+            model.prog_dorm.requires_grad_(True)
+            known = torch.zeros_like(model.prog_dorm)
+            known[:PROG_UNKNOWN] = 1.0
+            ptrace = []
+            ptrace_loss = _fit(model, C, dev, [model.prog_dorm], prog_lr, steps, batch_rows, seed + 1,
+                               mask=lambda: model.prog_dorm.grad.mul_(known),
+                               after_step=lambda: (clamp_known_progress(model.prog_dorm),
+                                                   ptrace.append(model.prog_dorm.detach()[:PROG_UNKNOWN].clone())))
+            model.prog_dorm.requires_grad_(False)
+            after = _full_loss(model, C, dev)
+            pd = model.prog_dorm.detach()
+            info |= {"prog_lr": prog_lr, "prog_clamp": PROG_CLAMP, "prog_train_loss_after": after, "prog_trace": ptrace_loss,
+                     "prog_dorm_before": state0["prog_dorm"].tolist(), "prog_dorm_after": pd.tolist(),
+                     "prog_dorm_at_step": {s: ptrace[s].tolist() for s in (499, 999, 1999, steps - 1) if s < len(ptrace)},
+                     "prog_at_bound": int((pd[:PROG_UNKNOWN].abs() >= PROG_CLAMP).sum())}
+            allowed.add("prog_dorm")
+            log(f"  progress residuals [OUT, IN_exo] by state: {np.round(pd.cpu().numpy(), 2).tolist()}; "
+                f"train NLL {mid:.4f} -> {after:.4f}")
+        sd = model.state_dict()
+        for k, v in state0.items():  # nothing outside the refit rows moved
+            if k == "time_head.2.weight":
+                assert torch.equal(torch.cat([sd[k][:DORMANT], sd[k][DORMANT + 1:]]), torch.cat([v[:DORMANT], v[DORMANT + 1:]]))
+            elif k == "time_head.2.bias":
+                assert torch.equal(torch.cat([sd[k][:DORMANT], sd[k][DORMANT + 1:]]), torch.cat([v[:DORMANT], v[DORMANT + 1:]]))
+            elif k == "prog_dorm":
+                assert torch.equal(sd[k][PROG_UNKNOWN], v[PROG_UNKNOWN])
+            else:
+                assert torch.equal(sd[k], v), k
+        info["rows_changed"] = int(((sd["time_head.2.weight"] - state0["time_head.2.weight"]).abs().sum(1) > 0).sum())
+        return info
+    finally:
+        model.plan_inference = was_inference
+        for p, q in req.items():
+            p.requires_grad_(q)
 
 
 def ensure_recalibrated(pilot: Path, model_name: str, out: Path, cutoff_months=0, dev="cuda", log=print) -> dict:
