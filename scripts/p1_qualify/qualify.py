@@ -39,7 +39,7 @@ def fit(sl, name, seed):
     from lpw.p1.recal import ensure_recalibrated
     from lpw.p1.train import train
     out = run_dir(sl, name, seed)
-    if not (out / "model.pt").exists():
+    if not ((out / "model.pt").exists() and (out / "train.json").exists()):  # train.json = training completed
         out.mkdir(parents=True, exist_ok=True)
         info = train(PILOTS[sl], name, out, seed=int(seed), lr=LR, epochs=80, log=log)
         log(f"{sl}/{out.name}: best val {info['best_val']:.4f} at epoch {info['best_epoch']}")

@@ -15,7 +15,7 @@ one() {  # slice name seed
 export -f one; export R Q
 echo "$(date +%T) fits"
 for sl in 2018 2021; do for n in tf_alibi tf_ref b1; do for s in 20261104 20261105; do echo "$sl $n $s"; done; done; done \
-  | xargs -P 4 -L 1 bash -c 'one $0 $1 $2'
+  | xargs -P 4 -L 1 bash -e -c 'one $0 $1 $2'  # -e: a failed fit / eval stops that job (xargs then exits non-zero)
 echo "$(date +%T) report"
 $Q report
 echo "$(date +%T) done"
