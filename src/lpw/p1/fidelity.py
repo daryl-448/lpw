@@ -164,10 +164,25 @@ def compare(real: Sample, synth: Sample, groups: dict[str, np.ndarray], paired: 
         res["M1"]["pass_overall"] = res["M1"]["pass"]
         res["M1"]["pass"] = res["M1"]["pass"] and all(v["pass"] for v in res["M1"]["per_kind"].values())
         res["pass_rate"] = float(np.mean([res[mid]["pass"] for mid, _, _ in METRICS]))
+        # continuous companion of pass_rate (does not flip when a metric sits at the 2x threshold): geometric mean of the
+        # synth / floor ratios over M1-M16; finite ratios only, n_ratio says how many entered
+        lr = np.array([np.log(res[mid]["ratio"]) for mid, _, _ in METRICS if np.isfinite(res[mid]["ratio"]) and res[mid]["ratio"] > 0])
+        res["ratio_gmean"] = float(np.exp(lr.mean())) if len(lr) else float("nan")
+        res["n_ratio"] = int(len(lr))
         res["n_real"] = int(len(R))
         res["n_synth"] = int(len(S))
         out[gname] = res
     return out
+
+
+def drop_largest_group(groups: dict[str, np.ndarray], real: Sample, group_of_agent: np.ndarray) -> tuple[dict[str, np.ndarray], int]:
+    """groups without the agents of the real group (group_of_agent[agent id]) holding the most real events: the
+    event-pooled metrics are otherwise dominated by one group. Returns (groups, dropped group id)."""
+    n = np.bincount(real.ev_agent, minlength=len(group_of_agent))
+    ug, inv = np.unique(group_of_agent, return_inverse=True)
+    big = ug[np.argmax(np.bincount(inv, n[:len(group_of_agent)]))]
+    keep = np.flatnonzero(group_of_agent != big)
+    return {k: np.intersect1d(v, keep) for k, v in groups.items()}, int(big)
 
 
 def groups_for(ag: pl.DataFrame, age_edges: np.ndarray | None = None) -> dict[str, np.ndarray]:
