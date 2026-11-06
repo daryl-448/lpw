@@ -63,28 +63,50 @@ def plan_targets(store) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 class PlanPrior:
-    """p(s | role, cohort, profile): multinomial logistic regression over the joint (count, amount) bucket, fitted
-    on training-split agents. Joint, because count and amount level are correlated."""
+    """p(s | role, cohort, profile[, exposure]): multinomial logistic regression over the joint (count, amount)
+    bucket, fitted on training-split agents. Joint, because count and amount level are correlated.
 
-    def __init__(self, store, seed=0):
+    exposure=True adds the public activation-time inputs the generator also conditions on (Sol pace round): most
+    agents are born in W and have an empty profile, so without them every born agent of a role gets the same plan
+    distribution whatever share of the window it is active. Features: u = log1p(exposure days) / log(366) with
+    exposure = w_end - origin, u^2, the activation month (sin, cos of the window fraction), and u x cohort, u x role."""
+
+    def __init__(self, store, seed=0, exposure: bool = False, C: float = 1.0):
         from sklearn.linear_model import LogisticRegression
+        self.exposure, self.w_start, self.w_end = exposure, float(store.w_start), float(store.w_end)
         tr = store.agents("train")
-        X = self._x(store.role[tr], store.cohort[tr], np.stack([store.prof_vec(a) for a in tr]))
+        X = self.features(store, tr)
         y = store.plan_n[tr] * N_PLAN_A + store.plan_a[tr]
-        self.clf = LogisticRegression(max_iter=3000, C=1.0, random_state=seed).fit(X, y)
+        self.clf = LogisticRegression(max_iter=5000 if exposure else 3000, C=C, random_state=seed).fit(X, y)  # 3000: as before
         va = store.agents("val")
-        Xv = self._x(store.role[va], store.cohort[va], np.stack([store.prof_vec(a) for a in va]))
-        p = self.clf.predict_proba(Xv)
+        p = self.clf.predict_proba(self.features(store, va))
         yv = store.plan_n[va] * N_PLAN_A + store.plan_a[va]
         col = {c: i for i, c in enumerate(self.clf.classes_)}
         self.val_nll = float(-np.mean([np.log(max(p[i, col[c]], 1e-12)) if c in col else np.log(1e-12) for i, c in enumerate(yv)]))
 
-    @staticmethod
-    def _x(role, cohort, prof):
-        return np.concatenate([np.asarray(role)[:, None], np.asarray(cohort)[:, None], prof], 1).astype(np.float64)
+    def features(self, store, agents) -> np.ndarray:
+        return self._x(store.role[agents], store.cohort[agents], np.stack([store.prof_vec(a) for a in agents]), store.origin[agents])
 
-    def sample(self, role, cohort, prof, rng) -> tuple[np.ndarray, np.ndarray]:
-        p = self.clf.predict_proba(self._x(role, cohort, prof))
+    def _x(self, role, cohort, prof, origin=None):
+        role, cohort = np.asarray(role, np.float64), np.asarray(cohort, np.float64)
+        x = [role[:, None], cohort[:, None], np.asarray(prof, np.float64)]
+        if self.exposure:
+            assert origin is not None, "exposure prior: pass the agents' origins"
+            o = np.asarray(origin, np.float64)
+            u = np.log1p(np.maximum(self.w_end - o, 0) / 86400.0) / np.log(366.0)
+            f = (o - self.w_start) / (self.w_end - self.w_start)
+            x += [np.stack([u, u * u, np.sin(2 * np.pi * f), np.cos(2 * np.pi * f), u * cohort, u * role], 1)]
+        return np.concatenate(x, 1)
+
+    def proba(self, role, cohort, prof, origin=None) -> np.ndarray:
+        """(n, N_PLAN_N * N_PLAN_A) joint probabilities, columns indexed by plan_n * N_PLAN_A + plan_a."""
+        p = self.clf.predict_proba(self._x(role, cohort, prof, origin))
+        out = np.zeros((len(p), N_PLAN_N * N_PLAN_A))
+        out[:, self.clf.classes_] = p
+        return out
+
+    def sample(self, role, cohort, prof, rng, origin=None) -> tuple[np.ndarray, np.ndarray]:
+        p = self.clf.predict_proba(self._x(role, cohort, prof, origin))
         u = rng.random(len(p))[:, None]
         k = self.clf.classes_[np.minimum((p.cumsum(1) < u).sum(1), p.shape[1] - 1)]
         return k // N_PLAN_A, k % N_PLAN_A
