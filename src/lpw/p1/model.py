@@ -370,6 +370,7 @@ class Model(nn.Module):
             ap = self.anchor.apply_amt(ap, x, B["_plan_n_eff"][rows_b], B["_plan_a_eff"][rows_b])
         if self._capture is not None:
             self._capture["amt_ap_final"] = ap.detach()
+            self._capture["amt_ap_live"] = ap  # with its graph (lpw.p1.drift_ft consistency term)
         return ap
 
     # ---- likelihood ----------------------------------------------------------------------------------------
@@ -385,6 +386,8 @@ class Model(nn.Module):
         N = len(rb)
         hk, ho = Hk[rb, rj], Ho[rb, rj]
         logpk, law, tout = self.kind_time(hk, ho, t0, **self.row_extras(B))
+        if self._capture is not None:
+            self._capture.update(logpk_live=logpk, law_live=law)  # with their graph (lpw.p1.drift_ft)
         own = typ == 1
         cen = (typ == 2) | (typ == 3)
         tk = B["row_tkind"].clamp(min=0)
