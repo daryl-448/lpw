@@ -3,8 +3,11 @@ base qualification).
 
 Starting point: a full-train lpw_plan_prog checkpoint (B). Trainable: the upper two encoder layers, the final norm,
 time_head and amt_head; everything else (embeddings, lower layers, kind / counterparty heads, progress residuals) is
-frozen. AdamW, weight decay 0.1, lr 1e-5 (encoder / norm) and 1e-4 (heads), constant, at most 1200 updates;
-snapshots at SNAPS (step 0 = B). No recalibration afterwards.
+frozen. AdamW, weight decay 0.1, lr 1e-5 for every trainable group (B's final training LR), constant, on every
+training group, at most 1200 attempted updates; snapshots at SNAPS (step 0 = B; numbering counts attempted steps,
+GradScaler-skipped ones are recorded in ft.json). No recalibration afterwards.
+Development amendment (Sol review r1, reports/p1_drift_screen.md): the design's head lr 1e-4 and 20% group exclusion
+were replaced after a C-only likelihood pilot (runs/p1_drift_pilot); the 20% group subset is reported-only retention data.
 
 Arms (identical clean batches, plan-dropout draws and optimiser schedule):
   C  clean likelihood only (train.py's loss: plain per-prefix likelihood with censoring and plan dropout, scaled by
@@ -17,7 +20,7 @@ J (shift consistency): on auxiliary prefixes of the fine-tune agents (agent draw
 k in [1, n] uniformly; agent-balanced, independent of the clean batches), the student on a corrupted copy of the
 prefix (anchor.corrupt_view: prefix-wide gap shift 10^{-0.3, 0, +0.3}, log-amount shift {-0.5, 0, +0.5}, probabilities
 0.25 / 0.5 / 0.25, independently) is pulled towards the frozen B on the clean prefix. Both use the real (known) plan
-and deterministic (eval-mode) forwards, so at step 0 J is the shift response of B itself (zero on unshifted rows). J = 1/2 mean over rows of the mean squared
+and deterministic (eval-mode) forwards, so at step 0 J is the shift response of B itself (zero, up to numerical tolerance, on unshifted rows). J = 1/2 mean over rows of the mean squared
 difference of the next-owned-event gap CDF (kind mixture) at GAP_POINTS + 1/2 mean over owned-target rows of the mean
 squared difference of the truncated amount CDF at AMT_GRID; the time and amount terms are averaged separately first.
 The amount comparison conditions both forwards on the same real next event (kind, time, counterparty class / target).
@@ -42,12 +45,17 @@ SNAPS = (0, 25, 50, 100, 200, 400, 800, 1200)
 KAPPA = 0.25  # target ratio of the J gradient norm to the clean one at step 0
 CAL_BATCHES = 16
 CAL_SEED = 777
-LR_ENC, LR_HEAD, WD = 1e-5, 1e-4, 0.1
+LR_ENC, LR_HEAD, WD = 1e-5, 1e-5, 0.1
 AUX_ROWS = 128
-HOLDOUT = 0.2  # share of training groups withheld from fine-tuning (anchor.split_groups, seed 0)
+HOLDOUT = 0.0  # share of training groups withheld from fine-tuning (anchor.split_groups, seed 0); 0 = none
 AMT_GRID = np.linspace(DUST_LOG10, SUPPLY_LOG10, 64)
 GAP_MID = np.sqrt(EDGES[:-1] * EDGES[1:])  # 62 finite-bin log midpoints; the gap CDF is also taken at 0 (the
 # same-second atom) and at the finite-support end (365 d), where 1 - F is the dormant mass: 64 points
+
+
+def file_sha(path) -> str:
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def trainable(model):
@@ -71,16 +79,21 @@ def gap_cdf(logpk, law):
 
 
 def amt_cdf(ap, k):
-    """(n, 64) CDF of the truncated amount mixture at AMT_GRID. Float64, differentiable."""
+    """(n, 64) CDF of the truncated amount mixture at AMT_GRID. Float64, differentiable. Interval masses in log space
+    (model.log_interval_mass), so saturated components stay finite; the grid ends are exactly 0 and 1."""
+    from lpw.p1.model import log_interval_mass
     logit, mu, ls = ap.double().split(k, -1)
     sig = torch.exp(ls.clamp(-4, 2))
-    w = torch.softmax(logit, -1)
-    nd = torch.special.ndtr
-    g = torch.as_tensor(AMT_GRID, dtype=torch.float64, device=ap.device)
-    lo = nd((DUST_LOG10 - mu) / sig)
-    den = (w * (nd((SUPPLY_LOG10 - mu) / sig) - lo)).sum(-1)
-    num = (w[:, None] * (nd((g[None, :, None] - mu[:, None]) / sig[:, None]) - lo[:, None])).sum(-1)
-    return num / den[:, None]
+    lw = torch.log_softmax(logit, -1)
+    al = (DUST_LOG10 - mu) / sig
+    lden = torch.logsumexp(lw + log_interval_mass(al, (SUPPLY_LOG10 - mu) / sig), -1)
+    g = torch.as_tensor(AMT_GRID[1:-1], dtype=torch.float64, device=ap.device)
+    gz = (g[None, :, None] - mu[:, None]) / sig[:, None]
+    lnum = torch.logsumexp(lw[:, None] + log_interval_mass(al[:, None].expand_as(gz), gz), -1)
+    inner = torch.exp(lnum - lden[:, None]).clamp(0.0, 1.0)
+    n = ap.shape[0]
+    return torch.cat([torch.zeros(n, 1, dtype=torch.float64, device=ap.device), inner,
+                      torch.ones(n, 1, dtype=torch.float64, device=ap.device)], 1)
 
 
 def forecast_cdfs(model, b):
@@ -194,7 +207,11 @@ def calibrate_wj(model, teacher, views, agents, ref_rows, dev, kappa=KAPPA, n=CA
             gj.append(gnorm(J.float()))
             jv.append(J.item())
     _restore(model, was)
-    w = kappa * float(np.median(gc)) / float(np.median(gj))
+    ok = len(gc) == n and len(gj) == n and np.isfinite(gc).all() and np.isfinite(gj).all() and np.isfinite(jv).all()
+    mc, mj = float(np.median(gc)), float(np.median(gj))
+    w = kappa * mc / mj if ok and mj > 0 else float("nan")
+    if not (ok and mc > 0 and mj > 0 and np.isfinite(w) and w > 0):
+        raise RuntimeError(f"w_J calibration invalid (pairs {len(gc)}/{len(gj)} of {n}, medians {mc}, {mj}); aborting")
     return {"w_j": w, "kappa": kappa, "n": n, "seed": seed, "grad_clean": gc, "grad_J": gj, "J": jv}
 
 
@@ -234,7 +251,7 @@ def finetune(pilot: Path, base: Path, out: Path, arm: str, steps=SNAPS[-1], kapp
     info = {"arm": arm, "base": str(base), "pilot": str(pilot), "seed": seed, "w_j": w_j, "calibration": cal,
             "lr_enc": lr_enc, "lr_head": lr_head, "wd": WD, "steps": steps, "snaps": list(SNAPS), "aux_rows": AUX_ROWS,
             "ref_rows": ref_rows, "holdout": holdout, "fit_agents": int(len(fit)), "holdout_agent_ids": [int(x) for x in hold],
-            "trainable": int(sum(p.numel() for p in enc + head)), "trace": []}
+            "trainable": int(sum(p.numel() for p in enc + head)), "trace": [], "skipped_steps": []}
 
     def snap(s):
         d = out / f"step{s:04d}"
@@ -242,6 +259,7 @@ def finetune(pilot: Path, base: Path, out: Path, arm: str, steps=SNAPS[-1], kapp
         with atomic_path(d / "model.pt") as t:
             torch.save(model.state_dict(), t)
         shutil.copy(base / "train.json", d / "train.json")
+        info.setdefault("snap_sha", {})[str(s)] = file_sha(d / "model.pt")
         j = eval_j(model, teacher, [(to_dev(c, dev), to_dev(r, dev)) for c, r in jeval], dev)
         info["trace"].append({"step": s, **j})
         log(f"[{arm}] snapshot {s}: monitor J {j['J']:.3e} (time {j['J_time']:.3e}, amount {j['J_amt']:.3e})")
@@ -274,9 +292,12 @@ def finetune(pilot: Path, base: Path, out: Path, arm: str, steps=SNAPS[-1], kapp
             scaler.scale(tot).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(enc + head, 1.0 * scale)
+            s0 = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
             step += 1
+            if scaler.get_scale() < s0:  # inf / nan gradients: the update was skipped
+                info["skipped_steps"].append(step)
             run["clean"] += loss.item()
             run["n"] += 1
             if step % 25 == 0:

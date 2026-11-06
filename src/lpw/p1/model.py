@@ -113,6 +113,20 @@ def gauss_logpdf(params, a):
     return -0.5 * ((a - mu[:, 0]) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
 
 
+def trunc_mog_mean(params, k):
+    """mean of the truncated mixture on [dust floor, total supply] (float64): each component's truncated-normal mean
+    mu + sigma (phi(alpha) - phi(beta)) / Z, weighted by w Z / sum w Z; ratios in log space, so deep-tail components
+    stay finite (their mean tends to the nearer bound)."""
+    logit, mu, ls = params.double().split(k, -1)
+    sig = torch.exp(ls.clamp(-4, 2))
+    al, be = (DUST_LOG10 - mu) / sig, (SUPPLY_LOG10 - mu) / sig
+    lz = log_interval_mass(al, be)
+    lphi = lambda z: -0.5 * z * z - 0.5 * math.log(2 * math.pi)
+    m = mu + sig * (torch.exp(lphi(al) - lz) - torch.exp(lphi(be) - lz))
+    lw = torch.log_softmax(logit, -1) + lz
+    return (torch.softmax(lw, -1) * m.clamp(DUST_LOG10, SUPPLY_LOG10)).sum(-1)
+
+
 def mog_mean(params, k):
     logit, mu, _ = params.split(k, -1)
     return (torch.softmax(logit, -1) * mu).sum(-1).clamp(DUST_LOG10, SUPPLY_LOG10)

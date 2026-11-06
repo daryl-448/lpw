@@ -1,10 +1,11 @@
 """Drift screen v2 (reports/p1_drift_screen.md): arms B (untouched lpw_plan_prog base), C (clean partial-backbone
 fine-tune) and R (clean + shift consistency J), fitted by `python -m lpw.p1.drift_ft` into ROOT/{C,R}/stepNNNN.
 
-  eval ARM STEP  likelihood rows (exact prefixes, known-plan AND unknown-plan full NLL, on the adaptation holdout and
-                 val) and shift forecasts on the real val items, for one checkpoint -> ROOT/eval/ARM_STEP.npz
-                 (B = arm "B", step 0; C / R step 0 are B and reuse its file)
-  select         likelihood budget, C by unknown-plan val NLL, R by shift ratio, both among feasible snapshots
+  eval ARM STEP  likelihood rows (exact prefixes, known-plan AND unknown-plan full NLL, on val and on the reported-only
+                 retention subset = the 20% training-group mask anchor.split_groups seed 0) and shift forecasts on
+                 the real val items, for one checkpoint -> ROOT/eval/ARM_STEP.npz, fingerprinted by the checkpoint's
+                 sha256 (B = arm "B", step 0; C / R step 0 are B and reuse its file)
+  select         val likelihood budget, C by unknown-plan val NLL, R by shift ratio, both among feasible snapshots
                  -> ROOT/select.json
   gen ARM        for the selected checkpoint of ARM (B, C, R): oracle pilot generation (G, D) and prior-mode
                  full-val-population generation (safety, fidelity) -> ROOT/gen/
@@ -26,7 +27,8 @@ from lpw.p1.batch import CTX, Views, collate, exact_specs, pack
 from lpw.p1.drift_ft import SNAPS
 from lpw.p1.fidelity import Sample, compare, drop_largest_group, groups_for, real_frames
 from lpw.p1.generate import generate
-from lpw.p1.model import mog_mean
+from lpw.p1.drift_ft import file_sha
+from lpw.p1.model import trunc_mog_mean
 from lpw.p1.plan import COUNT_EDGES, N_PLAN_N, PlanPrior
 from lpw.p1.store import IN_AGENT, OUT, PERIPHERY, TIER_VENUE, VENUE, build_store, derived
 from lpw.p1.timelaw import EDGES
@@ -34,11 +36,15 @@ from lpw.p1.train import load, loader, to_dev
 
 NBOOT, LMAX, S_RED, D_RED, G_RED = 1000, 0.02, 0.25, 0.25, 0.15
 FID_NORMAL, FID_SCAM, FID_BOOT, RUN_X = 0.10, 1.05, 200, 10
+RETENTION, COVER_TOL = 0.2, 0.05
+FID_GROUPS = ("normal", "scam")
 PILOT_REPS, PRIOR_REPS, PILOT_CAP, PRIOR_CAP, GEN_SEED, PLAN_SEED = 3, 3, 150, 10_000, 7, 101
 DEPTHS, DD = (3, 9, 29, 99), (9, 29, 99)
 SHIFTS = {"dt+": (0.3, 0.0), "dt-": (-0.3, 0.0), "da+": (0.0, 0.5), "da-": (0.0, -0.5)}
 PLAN300 = int(np.searchsorted(COUNT_EDGES, 300))  # count bucket index of >= 300 owned events
 EV = ("kind", "ts", "cls", "ent", "venue", "amt", "eth", "fee", "bal")
+GEN_RECIPE = {"pilot_reps": PILOT_REPS, "prior_reps": PRIOR_REPS, "pilot_cap": PILOT_CAP, "prior_cap": PRIOR_CAP, "gen_seed": GEN_SEED,
+              "plan_seed": PLAN_SEED, "population": "val"}
 X = None  # bin log-midpoints on the GPU (forecast)
 
 
@@ -52,8 +58,7 @@ class Ctx:
         gid_of = dict(zip(ag["node_id"].to_list(), ag["group_id"].to_list()))
         self.gid = np.array([gid_of[int(x)] for x in st.node_id])  # per store agent
         from lpw.p1.anchor import split_groups
-        from lpw.p1.drift_ft import HOLDOUT
-        self.fit, self.hold = split_groups(st, self.pilot, HOLDOUT)
+        self.ret = split_groups(st, self.pilot, RETENTION)[1]  # reported-only retention subset (in B's and C/R's training data)
 
     def ckpt(self, arm, step):
         return self.base if arm == "B" or step == 0 else self.root / arm / f"step{step:04d}"
@@ -94,8 +99,10 @@ def rows_nll(ctx, m, agents, known):
 
 @torch.no_grad()
 def forecast(ctx, m, vs, ks, shift=(0.0, 0.0)):
-    """per (view, prefix length k), known plan: (Elog10 positive-finite gap of the next owned event, amount forecast
-    mean at the real next event if it is owned, else nan). As scripts/p1_anchor/rescreen.py."""
+    """per (view, prefix length k), known plan: (Elog10 positive-finite gap of the next owned event, mean of the
+    truncated log10-amount distribution at the real next event if it is owned, else nan). As
+    scripts/p1_anchor/rescreen.py, except the amount forecast is the truncated mixture's mean (model.trunc_mog_mean)
+    rather than the clamped untruncated mean."""
     global X
     if X is None:
         X = torch.as_tensor(np.log10(np.sqrt(EDGES[:-1] * EDGES[1:])), device="cuda")
@@ -122,7 +129,7 @@ def forecast(ctx, m, vs, ks, shift=(0.0, 0.0)):
         ap = m._capture["amt_ap_final"]
         m._capture = None
         mean = np.full(n, np.nan)
-        mean[t["o_row"].cpu().numpy()] = mog_mean(ap.float(), m.cfg.k_mix).cpu().numpy()
+        mean[t["o_row"].cpu().numpy()] = trunc_mog_mean(ap, m.cfg.k_mix).cpu().numpy()
         am.append(mean)
     return np.concatenate(el), np.concatenate(am)
 
@@ -152,8 +159,8 @@ def shift_items(ctx):
 
 def cmd_eval(ctx, arm, step):
     m = ctx.model(arm, step)
-    out = {}
-    for sname, agents in (("holdout", ctx.hold), ("val", ctx.va)):
+    out = {"sha": np.array(file_sha(ctx.ckpt(arm, step) / "model.pt")), "arm": np.array(arm), "step": np.array(step)}
+    for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):
         for mode in ("known", "unknown"):
             nll, who = rows_nll(ctx, m, agents, mode == "known")
             out[f"nll_{sname}_{mode}"] = nll
@@ -171,11 +178,13 @@ def cmd_eval(ctx, arm, step):
     with atomic_path(ctx.root / "eval" / f"{arm}_{step:04d}.npz") as t, open(t, "wb") as f:
         np.savez(f, **out)
     print(f"eval {arm} step {step}: val unknown {out['nll_val_unknown'].mean():.4f} known {out['nll_val_known'].mean():.4f}, "
-          f"holdout unknown {out['nll_holdout_unknown'].mean():.4f}")
+          f"retention unknown {out['nll_retention_unknown'].mean():.4f}")
 
 
 def load_eval(ctx, arm, step):
-    return dict(np.load(ctx.root / "eval" / f"{'B' if step == 0 else arm}_{step:04d}.npz"))
+    E = dict(np.load(ctx.root / "eval" / f"{'B' if step == 0 else arm}_{step:04d}.npz"))
+    assert str(E["sha"]) == file_sha(ctx.ckpt(arm, step) / "model.pt"), f"eval of {arm} step {step} is not of the current checkpoint"
+    return E
 
 
 # ---- selection -------------------------------------------------------------------------------------------------------
@@ -184,16 +193,40 @@ def cells(ctx, who):
     return {"all": np.ones(len(who), bool), "normal": st.role[who] == 0, "scam": st.role[who] == 1, "plan>=300": st.plan_n[who] >= PLAN300}
 
 
-def budget(ctx, E, EB):
-    """{set_mode: {cell: arm - B}} per-prefix NLL deltas; feasible when every one is <= LMAX."""
-    d = {}
-    for sname in ("holdout", "val"):
-        assert np.array_equal(E[f"who_{sname}"], EB[f"who_{sname}"])
-        cs = cells(ctx, EB[f"who_{sname}"])
-        for mode in ("known", "unknown"):
-            a, b = E[f"nll_{sname}_{mode}"], EB[f"nll_{sname}_{mode}"]
-            d[f"{sname}_{mode}"] = {c: float(a[mm].mean() - b[mm].mean()) for c, mm in cs.items()}
-    return d
+def budget(ctx, E, EB, sname="val", boot=False):
+    """{sname_mode: {cell: arm - B}} per-prefix NLL deltas (feasible when every val one is <= LMAX); boot=True adds
+    whole-group bootstrap 95% intervals and the cell's agent / group counts (reported, not gated)."""
+    d, ci = {}, {}
+    assert np.array_equal(E[f"who_{sname}"], EB[f"who_{sname}"])
+    who = EB[f"who_{sname}"]
+    cs = cells(ctx, who)
+    for mode in ("known", "unknown"):
+        a, b = E[f"nll_{sname}_{mode}"], EB[f"nll_{sname}_{mode}"]
+        d[f"{sname}_{mode}"] = {c: float(a[mm].mean() - b[mm].mean()) for c, mm in cs.items()}
+        if boot:
+            for c, mm in cs.items():
+                g = ctx.gid[who[mm]]
+                ug, inv = np.unique(g, return_inverse=True)
+                gs, gn = np.bincount(inv, a[mm] - b[mm], len(ug)), np.bincount(inv, minlength=len(ug)).astype(float)
+                dr = np.random.default_rng(4).integers(0, len(ug), (NBOOT, len(ug)))
+                bs = gs[dr].sum(1) / gn[dr].sum(1)
+                ci[f"{sname}_{mode}/{c}"] = {"lo": float(np.quantile(bs, 0.025)), "hi": float(np.quantile(bs, 0.975)),
+                                              "agents": int(len(np.unique(who[mm]))), "groups": int(len(ug)), "prefixes": int(mm.sum())}
+    return (d, ci) if boot else d
+
+
+def pick(steps, scores, feasible):
+    """(step, score) of the lowest score among feasible snapshots, ties to the earlier step; steps ascending, and the
+    first (step 0 = B) must be feasible."""
+    assert list(steps) == sorted(steps) and feasible[0], "step 0 must be first and feasible"
+    best = None
+    for s, sc, f in zip(steps, scores, feasible):
+        if f and (best is None or sc < best[1]):
+            best = (s, sc)
+    return best
+
+
+RECIPE_KEYS_DIFFER = ("arm", "w_j", "calibration", "trace", "sec", "snap_sha", "skipped_steps")
 
 
 def mean_abs_normal(ctx, E, k):
@@ -205,38 +238,58 @@ def cmd_select(ctx):
     EB = load_eval(ctx, "B", 0)
     sB = {k: mean_abs_normal(ctx, EB, k) for k in ("e_tt", "e_aa")}
     base_sd = torch.load(ctx.base / "model.pt", map_location="cpu")
+    ft = {arm: json.loads((ctx.root / arm / "ft.json").read_text()) for arm in ("C", "R")}
+    rc = {arm: {k: v for k, v in f.items() if k not in RECIPE_KEYS_DIFFER} for arm, f in ft.items()}
+    assert rc["C"] == rc["R"], "C and R recipes differ beyond J"
+    assert ft["C"]["w_j"] == 0.0 and ft["R"]["w_j"] > 0 and ft["R"]["calibration"] is not None
     res = {"B_shift": sB, "arms": {}}
     for arm in ("C", "R"):
         sd0 = torch.load(ctx.root / arm / "step0000" / "model.pt", map_location="cpu")
         assert sd0.keys() == base_sd.keys() and all(torch.equal(sd0[k], base_sd[k]) for k in sd0), f"{arm} step 0 is not B"
-        ft = json.loads((ctx.root / arm / "ft.json").read_text())
-        assert Path(ft["base"]).resolve() == ctx.base.resolve() and ft["holdout_agent_ids"] == [int(x) for x in ctx.hold]
-        rows, best = [], None
+        f = ft[arm]
+        assert Path(f["base"]).resolve() == ctx.base.resolve() and Path(f["pilot"]).resolve() == ctx.pilot.resolve()
+        assert f["holdout"] == 0 and not f["holdout_agent_ids"], "the registered recipe adapts every training group"
+        assert sorted(int(x) for x in f["snap_sha"]) == list(SNAPS)
+        rows = []
         for s in SNAPS:
+            assert f["snap_sha"][str(s)] == file_sha(ctx.ckpt(arm, s) / "model.pt") or s == 0
             E = load_eval(ctx, arm, s)
-            d = budget(ctx, E, EB)
+            d, ci = budget(ctx, E, EB, "val", boot=True)
+            ret = budget(ctx, E, EB, "retention")
             feas = all(v <= LMAX for c in d.values() for v in c.values())
             sh = {k: mean_abs_normal(ctx, E, k) for k in ("e_tt", "e_aa")}
             ratio = max(sh["e_tt"] / sB["e_tt"], sh["e_aa"] / sB["e_aa"])
             val_u = float(E["nll_val_unknown"].mean())
             score = val_u if arm == "C" else ratio
-            rows.append({"step": s, "feasible": feas, "budget": d, "shift": sh, "shift_ratio": ratio, "val_unknown": val_u,
-                         "val_known": float(E["nll_val_known"].mean()), "score": score})
-            if feas and (best is None or score < best[1]):  # strict: ties keep the earlier snapshot
-                best = (s, score)
-        res["arms"][arm] = {"selected": best[0], "score": best[1], "snapshots": rows, "w_j": ft["w_j"]}
+            if not np.isfinite(score):
+                raise RuntimeError(f"{arm} step {s}: non-finite selection score")
+            rows.append({"step": s, "feasible": feas, "budget": d, "budget_ci": ci, "retention": ret, "shift": sh,
+                         "shift_ratio": ratio, "val_unknown": val_u, "val_known": float(E["nll_val_known"].mean()), "score": score})
+        best = pick([r_["step"] for r_ in rows], [r_["score"] for r_ in rows], [r_["feasible"] for r_ in rows])
+        res["arms"][arm] = {"selected": best[0], "score": best[1], "snapshots": rows, "w_j": f["w_j"],
+                            "skipped_steps": f["skipped_steps"], "sha": f["snap_sha"][str(best[0])] if best[0] else file_sha(ctx.base / "model.pt")}
     write_text(ctx.root / "select.json", json.dumps(res, indent=1))
     for arm, r in res["arms"].items():
-        print(f"select {arm}: step {r['selected']} (score {r['score']:.4f})")
+        print(f"select {arm}: step {r['selected']} (score {r['score']:.4f}); skipped updates {r['skipped_steps']}")
         for row in r["snapshots"]:
             worst = max(v for c in row["budget"].values() for v in c.values())
-            print(f"  step {row['step']:4d}: feasible {row['feasible']} (worst delta {worst:+.4f}), val unknown {row['val_unknown']:.4f}, "
+            print(f"  step {row['step']:4d}: feasible {row['feasible']} (worst val delta {worst:+.4f}), val unknown {row['val_unknown']:.4f}, "
+                  f"retention unknown {row['retention']['retention_unknown']['all']:+.4f}, "
                   f"shift e_tt {row['shift']['e_tt']:.4f} e_aa {row['shift']['e_aa']:.4f} ratio {row['shift_ratio']:.3f}")
 
 
 def selected(ctx):
     sel = json.loads((ctx.root / "select.json").read_text())
-    return {"B": 0, "C": sel["arms"]["C"]["selected"], "R": sel["arms"]["R"]["selected"]}, sel
+    steps = {"B": 0, "C": sel["arms"]["C"]["selected"], "R": sel["arms"]["R"]["selected"]}
+    for arm in ("C", "R"):
+        assert sel["arms"][arm]["sha"] == file_sha(ctx.ckpt(arm, steps[arm]) / "model.pt"), f"{arm}: selected checkpoint changed"
+    return steps, sel
+
+
+def check_gen(ctx, arm, step):
+    g = json.loads((ctx.root / "gen" / f"{arm}_gen.json").read_text())
+    assert g["step"] == step and g["sha"] == file_sha(ctx.ckpt(arm, step) / "model.pt"), f"{arm}: generation is not of the selected checkpoint"
+    assert g["recipe"] == GEN_RECIPE, f"{arm}: generation recipe differs"
 
 
 # ---- generation ------------------------------------------------------------------------------------------------------
@@ -275,7 +328,8 @@ def cmd_gen(ctx, arm):
     write_replicas(reps, gd / f"{arm}_prior.parquet")
     with atomic_path(gd / f"{arm}_prior.plans.npz") as t, open(t, "wb") as f:
         np.savez(f, plan_n=np.stack([p[0] for p in plans]), plan_a=np.stack([p[1] for p in plans]))
-    write_text(gd / f"{arm}_gen.json", json.dumps({"step": steps[arm], "pilot_capped": gi["capped"], "prior_capped": info["capped"]}, indent=1))
+    write_text(gd / f"{arm}_gen.json", json.dumps({"step": steps[arm], "sha": file_sha(ctx.ckpt(arm, steps[arm]) / "model.pt"), "recipe": GEN_RECIPE,
+                                                  "pilot_capped": gi["capped"], "prior_capped": info["capped"]}, indent=1))
     print(f"gen {arm} (step {steps[arm]}): pilot capped {gi['capped']}, prior capped {info['capped']}")
 
 
@@ -409,6 +463,8 @@ def cmd_report(ctx):
     real_items = [x for x in real_items if x[2] is not None]
     GENS, BOOT, DIS = {}, {}, {}
     for arm in ("B", "C", "R"):
+        check_gen(ctx, arm, steps[arm])
+    for arm in ("B", "C", "R"):
         raw = split_streams(pl.read_parquet(ctx.root / "gen" / f"{arm}_pilot.parquet"), n * PILOT_REPS)
         S = [(r["ts"].astype(np.float64), r["amt"].astype(np.float64)) for r in raw]
         ST = {k: tau(S, k) for k in (10, 30)}
@@ -435,7 +491,7 @@ def cmd_report(ctx):
                     sv.append(vv); sk.append(k); sidx.append(p)
         fs = forecast(ctx, m, sv, sk) if sv else (np.zeros(0), np.zeros(0))
         sidx = np.array(sidx, np.int64)
-        out = {}
+        out = {"reached": np.bincount(sidx, minlength=len(real_items))}  # replicas reaching the pair's depth
         for q, key in ((0, "D_t"), (1, "D_a")):
             num, cnt = np.zeros(len(real_items)), np.zeros(len(real_items))
             ok = np.isfinite(fs[q])
@@ -451,23 +507,31 @@ def cmd_report(ctx):
         RES["pilot"][f"R_vs_C_{k}"] = g = {"reduction": float(1 - r / c), "diff_lo": float(np.quantile(diff, 0.025)),
                                            "diff_hi": float(np.quantile(diff, 0.975))}
         say(f"  R vs C {k}: {c:.4f} -> {r:.4f}, reduction {g['reduction']:.3f}, C - R 95% [{g['diff_lo']:.4f}, {g['diff_hi']:.4f}]")
+    # D on the common support: pairs with a value in every arm (B, C, R); each pair's discrepancy is the mean over the
+    # replicas that reached the depth; per-depth coverage (share of real pairs with at least one reaching replica) is
+    # reported and guarded (R not more than COVER_TOL below C or B at any depth)
     pa_ = np.array([sa[j] for j, _, _ in real_items])
+    dep = np.array([d for _, d, _ in real_items])
+    common = {key: np.all([np.isfinite(DIS[a][key]) for a in DIS], 0) for key in ("D_t", "D_a")}
     for arm in DIS:
-        RES["discrepancy"][arm] = {key: {"mean_abs": float(np.nanmean(np.abs(x))), "pairs": int(np.isfinite(x).sum()),
-                                         **{f"mean_abs_d{d}": float(np.nanmean(np.abs(x[np.array([dd == d for _, dd, _ in real_items])]))) for d in DD}}
-                                   for key, x in DIS[arm].items()}
-        RES["discrepancy"][arm]["real_pairs"] = len(real_items)
+        RES["discrepancy"][arm] = {"coverage": {str(d): float((DIS[arm]["reached"][dep == d] > 0).mean()) for d in DD},
+                                   "replicas_reached_mean": float(DIS[arm]["reached"].mean() / PILOT_REPS)}
+        for key in ("D_t", "D_a"):
+            x, c = DIS[arm][key], common[key]
+            RES["discrepancy"][arm][key] = {"mean_abs_common": float(np.abs(x[c]).mean()), "pairs_common": int(c.sum()),
+                                            "mean_abs_own": float(np.nanmean(np.abs(x))), "pairs_own": int(np.isfinite(x).sum()),
+                                            **{f"mean_abs_common_d{d}": float(np.abs(x[c & (dep == d)]).mean()) if (c & (dep == d)).any() else float("nan") for d in DD}}
+    RES["discrepancy"]["real_pairs"] = len(real_items)
     ud = np.unique(pa_)
     Wd = boot_weights(ctx, ud, 3)
     posd = {a: i for i, a in enumerate(ud)}
     for key in ("D_t", "D_a"):
-        ok = np.isfinite(DIS["C"][key]) & np.isfinite(DIS["R"][key])
-        RES["discrepancy"][f"R_vs_C_{key}"] = r = red(DIS["C"][key][ok], DIS["R"][key][ok], Wd[:, [posd[a] for a in pa_[ok]]])
-        r["pairs_both"] = int(ok.sum())
-        say(f"(D) mean |{key}|: B {RES['discrepancy']['B'][key]['mean_abs']:.4f} ({RES['discrepancy']['B'][key]['pairs']} pairs) "
-            f"C {RES['discrepancy']['C'][key]['mean_abs']:.4f} ({RES['discrepancy']['C'][key]['pairs']}) "
-            f"R {RES['discrepancy']['R'][key]['mean_abs']:.4f} ({RES['discrepancy']['R'][key]['pairs']}) of {len(real_items)}; "
-            f"R vs C on {int(ok.sum())} shared pairs: reduction {r['reduction']:.3f} [{r['lo']:.3f}, {r['hi']:.3f}]")
+        c = common[key]
+        RES["discrepancy"][f"R_vs_C_{key}"] = r = red(DIS["C"][key][c], DIS["R"][key][c], Wd[:, [posd[a] for a in pa_[c]]])
+        r["pairs_common"] = int(c.sum())
+        say(f"(D) mean |{key}| on {int(c.sum())} common pairs of {len(real_items)}: B {RES['discrepancy']['B'][key]['mean_abs_common']:.4f} "
+            f"C {r['C']:.4f} R {r['R']:.4f}; R vs C reduction {r['reduction']:.3f} [{r['lo']:.3f}, {r['hi']:.3f}]")
+    say("    coverage by depth " + " | ".join(f"{a} " + " ".join(f"d{d} {RES['discrepancy'][a]['coverage'][str(d)]:.2f}" for d in DD) for a in DIS))
 
     # (P) safety and (F) fidelity on the prior-mode val population
     rmax = real_train_max_run(st)
@@ -481,24 +545,23 @@ def cmd_report(ctx):
     groups = groups_for(rag, edges)
     groups_drop, big = drop_largest_group(groups, realS, ctx.gid[va])
     RES["fidelity"]["dropped_group"] = big
-    plans0 = None
+    plans0, EVS = None, {}
     for arm in ("B", "C", "R"):
         P = dict(np.load(ctx.root / "gen" / f"{arm}_prior.plans.npz"))
         if plans0 is None:
             plans0 = P
         assert all(np.array_equal(P[k], plans0[k]) for k in P), "arms used different prior plans"
         ev = pl.read_parquet(ctx.root / "gen" / f"{arm}_prior.parquet")
+        EVS[arm] = ev
         sf = {"capped": [], "over3U": [], "zero_plan_nonempty": [], "runs_over": [], "max_run": [], "over_real_max": [],
               "overU": [], "open_over_real_max_len": []}
-        fid = {"all": [], "drop_largest": []}
         for r in range(PRIOR_REPS):
-            e = ev.filter(pl.col("replica") == r).drop("replica")
-            streams = split_streams(e, len(va))
-            N = np.array([len(s["ts"]) for s in streams])
+            streams = split_streams(ev.filter(pl.col("replica") == r).drop("replica"), len(va))
+            N = np.array([len(s_["ts"]) for s_ in streams])
             pn = P["plan_n"][r]
             fin = pn < N_PLAN_N - 1
             U = np.where(fin, COUNT_EDGES[np.minimum(pn + 1, N_PLAN_N - 1)] - 1, np.iinfo(np.int64).max)
-            runs = np.array([max_run(s["ts"]) for s in streams])
+            runs = np.array([max_run(s_["ts"]) for s_ in streams])
             sf["capped"].append(int((N >= PRIOR_CAP).sum()))
             sf["over3U"].append(int((fin & (N > 3 * U)).sum()))
             sf["zero_plan_nonempty"].append(int(((pn == 0) & (N > 0)).sum()))
@@ -507,22 +570,29 @@ def cmd_report(ctx):
             sf["over_real_max"].append(int((runs > rmax).sum()))
             sf["overU"].append(int((fin & (N > U)).sum()))
             sf["open_over_real_max_len"].append(int(((~fin) & (N > nmax)).sum()))
-            ag_s = rag.select("agent", "role", "cohort", "origin", "b0", "age_days")
-            syn = Sample(ag_s, e, st.w_start)
-            fid["all"].append(compare(realS, syn, groups, paired=True, n_boot=FID_BOOT, seed=r))
-            fid["drop_largest"].append(compare(realS, syn, groups_drop, paired=True, n_boot=FID_BOOT, seed=r))
         RES["safety"][arm] = sf
+        say(f"(P) {arm}: capped {sf['capped']}, finite-plan N > 3U {sf['over3U']} (zero-plan nonempty {sf['zero_plan_nonempty']}), "
+            f"runs > {RUN_X} x {rmax} {sf['runs_over']}; reported: max run {sf['max_run']}, runs > {rmax} {sf['over_real_max']}, "
+            f"N > U {sf['overU']}, open-bucket N > {nmax} {sf['open_over_real_max_len']}")
+    fgroups = {g: groups[g] for g in FID_GROUPS}
+    fgroups_drop = {g: groups_drop[g] for g in FID_GROUPS}
+    ag_s = rag.select("agent", "role", "cohort", "origin", "b0", "age_days")
+    for arm in ("B", "C", "R"):
+        fid = {"all": [], "drop_largest": []}
+        for r in range(PRIOR_REPS):
+            syn = Sample(ag_s, EVS[arm].filter(pl.col("replica") == r).drop("replica"), st.w_start)
+            fid["all"].append(compare(realS, syn, fgroups, paired=True, n_boot=FID_BOOT, seed=r))
+            fid["drop_largest"].append(compare(realS, syn, fgroups_drop, paired=True, n_boot=FID_BOOT, seed=r))
         RES["fidelity"][arm] = {}
         for view, fl in fid.items():
-            for g in ("normal", "scam"):
-                rg = [f[g]["ratio_gmean"] for f in fl]
+            for g in FID_GROUPS:
+                rg = np.array([f[g]["ratio_gmean"] for f in fl])
                 RES["fidelity"][arm][f"{view}/{g}"] = {
-                    "ratio_gmean": float(np.exp(np.mean(np.log(rg)))), "per_replica": rg,
-                    "n_ratio": [f[g]["n_ratio"] for f in fl], "mpass": float(np.mean([f[g]["pass_rate"] for f in fl])),
+                    "ratio_gmean": float(np.exp(np.mean(np.log(rg)))) if np.all(np.isfinite(rg) & (rg > 0)) else float("nan"),
+                    "per_replica": rg.tolist(), "n_ratio": [f[g]["n_ratio"] for f in fl], "mpass": float(np.mean([f[g]["pass_rate"] for f in fl])),
                     "mpass_per_replica": [f[g]["pass_rate"] for f in fl],
-                    "ratios": {mid: float(np.mean([f[g][mid]["ratio"] for f in fl])) for mid in fl[0][g] if isinstance(fl[0][g][mid], dict)}}
-        say(f"(P) {arm}: capped {sf['capped']}, finite-plan N > 3U {sf['over3U']} (zero-plan nonempty {sf['zero_plan_nonempty']}), "
-            f"runs > {RUN_X} x {rmax} {sf['runs_over']}; reported: max run {sf['max_run']}, runs > {rmax} {sf['over_real_max']}, N > U {sf['overU']}")
+                    "ratios": {mid: float(np.mean([f[g][mid]["ratio"] for f in fl])) for mid in fl[0][g] if isinstance(fl[0][g][mid], dict)},
+                    "M1_per_kind": {m: float(np.mean([f[g]["M1"]["per_kind"][m]["ratio"] for f in fl])) for m in fl[0][g]["M1"]["per_kind"]}}
         say(f"(F) {arm}: " + " | ".join(f"{k} gmean {v['ratio_gmean']:.3f} M-pass {v['mpass']:.3f} n_ratio {v['n_ratio']}"
                                         for k, v in RES["fidelity"][arm].items() if isinstance(v, dict)))
 
@@ -537,7 +607,9 @@ def cmd_report(ctx):
     for key in ("D_t", "D_a"):
         r = di[f"R_vs_C_{key}"]
         g[f"D mean |{key}| R vs C -{D_RED:.0%}, lower bound > 0"] = r["reduction"] >= D_RED and r["lo"] > 0
-        g[f"D mean |{key}| R <= B"] = di["R"][key]["mean_abs"] <= di["B"][key]["mean_abs"]
+        g[f"D mean |{key}| R <= B (common pairs)"] = di["R"][key]["mean_abs_common"] <= di["B"][key]["mean_abs_common"]
+    g[f"D coverage R >= C - {COVER_TOL} and >= B - {COVER_TOL} at every depth"] = all(
+        di["R"]["coverage"][str(d)] >= max(di["C"]["coverage"][str(d)], di["B"]["coverage"][str(d)]) - COVER_TOL for d in DD)
     pi = RES["pilot"]
     for k in ("pace_score", "amount_w1"):
         r = pi[f"R_vs_C_{k}"]
@@ -554,6 +626,7 @@ def cmd_report(ctx):
         g[f"F {n_} R <= (1 - {FID_NORMAL}) C and <= B"] = (fi["R"][n_]["ratio_gmean"] <= (1 - FID_NORMAL) * fi["C"][n_]["ratio_gmean"]
                                                          and fi["R"][n_]["ratio_gmean"] <= fi["B"][n_]["ratio_gmean"])
         g[f"F {s_} R <= {FID_SCAM} x B and C"] = fi["R"][s_]["ratio_gmean"] <= FID_SCAM * min(fi["B"][s_]["ratio_gmean"], fi["C"][s_]["ratio_gmean"])
+    g["F every ratio_gmean finite"] = all(np.isfinite(v["ratio_gmean"]) for a in ("B", "C", "R") for v in fi[a].values() if isinstance(v, dict))
     g["F n_ratio == 16 everywhere"] = all(x == 16 for a in ("B", "C", "R") for k, v in fi[a].items() if isinstance(v, dict) for x in v["n_ratio"])
     RES["gates"] = g
     say("\ngates:")
