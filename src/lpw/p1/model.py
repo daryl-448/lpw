@@ -42,6 +42,7 @@ class Cfg:
     plan: bool = False     # per-agent plan latent through the PROFILE token (lpw.p1.plan)
     progress: bool = False  # plan progress state -> learned residual on the dormant-atom logit (needs plan)
     pace: bool = False     # history-free pace reference + mean shrinkage of the time law (lpw.p1.pace; post-hoc only)
+    anchor: bool = False   # plan-conditioned residual adapters on the time and amount heads (lpw.p1.anchor)
 
 
 CONFIGS = {
@@ -54,6 +55,7 @@ CONFIGS = {
     "lpw_plan": Cfg("lpw_plan", plan=True),
     "lpw_plan_prog": Cfg("lpw_plan_prog", plan=True, progress=True),
     "lpw_plan_prog_pace": Cfg("lpw_plan_prog_pace", plan=True, progress=True, pace=True),
+    "lpw_plan_prog_anchor": Cfg("lpw_plan_prog_anchor", plan=True, progress=True, anchor=True),
 }
 
 
@@ -156,6 +158,11 @@ class Model(nn.Module):
             assert cfg.progress, "pace shrinkage is built on the progress model"
             from lpw.p1.pace import PaceRef
             self.pace = PaceRef(n_prof)
+        if cfg.anchor:
+            assert cfg.plan and not cfg.pace and not cfg.b2, "anchor adapters sit on the plan model's heads"
+            from lpw.p1.anchor import Anchor
+            self.anchor = Anchor(d, cfg.k_mix)
+        self._capture = None  # dict -> head inputs / base outputs are recorded here (lpw.p1.anchor caching)
         # plan latent at inference: False = unknown (NLL evaluation; no future information), True = use B["plan_*"]
         self.plan_inference = False
         self.kind_head = mlp(d, d, 2)
@@ -223,15 +230,29 @@ class Model(nn.Module):
             out["prog"] = self.row_progress(B)
         if self.cfg.pace:
             out["pace"] = self.pace.features(B)
+        if self.cfg.anchor:
+            out["anchor"] = (B["_plan_n_eff"][B["row_b"]], B["_plan_a_eff"][B["row_b"]])
         return out
 
-    def kind_time(self, hk, ho, t0, prog=None, pace=None):
+    def kind_time(self, hk, ho, t0, prog=None, pace=None, anchor=None):
         """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ). prog: row_progress, required for
-        progress models; pace: pace.features (x, eligible), required for pace models (see row_extras)."""
+        progress models; pace: pace.features (x, eligible), required for pace models; anchor: the row plans
+        (plan_n, plan_a), required for anchor models (see row_extras)."""
         logpk = torch.log_softmax(self.kind_head(hk), -1)
         n = hk.shape[0]
         inp = torch.cat([ho[:, None].expand(n, 2, -1), self.e_tkind.weight[None].expand(n, 2, -1)], -1)
         out = self.time_head(inp).reshape(2 * n, -1)
+        if self._capture is not None:
+            self._capture.update(logpk=logpk.detach(), ho=ho.detach(), out=out.detach())
+        if self.cfg.anchor:
+            assert anchor is not None, "anchor model: pass **model.row_extras(B)"
+            out = self.anchor.apply_time(out, ho, *anchor)
+        return self.time_law(logpk, out, t0, prog, pace)
+
+    def time_law(self, logpk, out, t0, prog=None, pace=None):
+        """the time law from the time-head output (2N, 95): progress residual on the dormant logit, normalization,
+        pace shrinkage. Returns (logpk, law, out)."""
+        n = logpk.shape[0]
         if self.cfg.progress:
             assert prog is not None, "progress model: pass prog=model.row_progress(B)"
             res = self.prog_dorm[prog].reshape(2 * n).to(out.dtype)
@@ -302,7 +323,15 @@ class Model(nn.Module):
             cpvec, led_e = torch.zeros_like(ctx), torch.zeros_like(ctx)
         else:
             led_e = self.led(led)
-        return self.amt_head(torch.cat([ctx, self.e_cls(cls), cpvec, led_e], -1))
+        x = torch.cat([ctx, self.e_cls(cls), cpvec, led_e], -1)
+        ap = self.amt_head(x)
+        if self._capture is not None:
+            self._capture.update(amt_x=x.detach(), amt_ap=ap.detach())
+        if self.cfg.anchor:
+            ap = self.anchor.apply_amt(ap, x, B["_plan_n_eff"][rows_b], B["_plan_a_eff"][rows_b])
+        if self._capture is not None:
+            self._capture["amt_ap_final"] = ap.detach()
+        return ap
 
     # ---- likelihood ----------------------------------------------------------------------------------------
     def terms(self, B, metrics=False) -> dict:
