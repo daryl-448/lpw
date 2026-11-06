@@ -82,6 +82,7 @@ def train(pilot: Path, model_name: str, out: Path, seed=20261104, epochs=80, pat
         store = build_store(pilot, cutoff=cutoff)
     cfg = CONFIGS[model_name]
     assert not (agent_alpha and cfg.b2), "agent weighting is not defined for B2"
+    assert not cfg.pace, "pace models are built post hoc from a trained checkpoint (python -m lpw.p1.pace)"
     views = Views(store, agent_weights(store, agent_alpha) if agent_alpha else None)
     model = Model(cfg, store.n_venues, store.prof_vec(0).shape[0], torch.as_tensor(store.venue_sc)).to(dev)
     if init is not None:

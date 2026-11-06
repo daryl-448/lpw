@@ -29,7 +29,7 @@ PROG_CLAMP = 8.0  # |residual| bound: with the real s the BELOW / DONE optima ar
 @torch.no_grad()
 def _cache(model, store, views, dev):
     from lpw.p1.train import loader, to_dev
-    keys = ("hk", "ho", "t0", "r", "typ", "tk", "w", "pg")
+    keys = ("hk", "ho", "t0", "r", "typ", "tk", "w", "pg") + (("px", "pe") if model.cfg.pace else ())
     C = {k: [] for k in keys}
     for b in loader(views, pack(exact_specs(store, store.agents("train")), views)):
         b = to_dev(b, dev)
@@ -44,6 +44,9 @@ def _cache(model, store, views, dev):
         C["tk"].append(b["row_tkind"].clamp(min=0))
         C["pg"].append(model.row_progress(b) if model.cfg.progress else torch.zeros(len(rb), device=rb.device, dtype=torch.int64))
         C["w"].append(b["agent_w"][rb].double() if "agent_w" in b else torch.ones(len(rb), device=rb.device, dtype=torch.float64))
+        if model.cfg.pace:
+            x, e = model.pace.features(b)
+            C["px"].append(x), C["pe"].append(e)
     return {k: torch.cat(v) for k, v in C.items()}
 
 
@@ -51,7 +54,12 @@ def _kind_time_loss(model, C, idx):
     """Per-row kind + time + censoring NLL, the same terms as Model._terms, averaged over rows with the training
     row weights (uniform unless the model was trained with agent weights)."""
     t0, r, typ, tk = C["t0"][idx], C["r"][idx], C["typ"][idx], C["tk"][idx]
-    logpk, law, _ = model.kind_time(C["hk"][idx].float(), C["ho"][idx].float(), t0, C["pg"][idx] if model.cfg.progress else None)
+    ex = {}
+    if model.cfg.progress:
+        ex["prog"] = C["pg"][idx]
+    if model.cfg.pace:
+        ex["pace"] = (C["px"][idx], C["pe"][idx])
+    logpk, law, _ = model.kind_time(C["hk"][idx].float(), C["ho"][idx].float(), t0, **ex)
     n = len(idx)
     r2 = r.repeat_interleave(2)
     logf = law.log_density(r2).view(n, 2)
@@ -107,6 +115,7 @@ def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, 
     those are exactly those of the first stage). Returns a summary."""
     if model.cfg.b2:
         return {"skipped": "b2"}
+    assert not model.cfg.pace, "pace arms refit only the progress residuals (refit_progress); the shared row stays"
     was_inference, req = model.plan_inference, {p: p.requires_grad for p in model.parameters()}
     model.eval()
     try:
@@ -136,27 +145,8 @@ def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, 
         info = {"rows": n, "steps": steps, "agent_alpha": agent_alpha, "train_loss_before": before, "train_loss_after": mid,
                 "trace": trace}
         log(f"  stop recalibration: kind+time+cens train NLL {before:.4f} -> {mid:.4f} over {n} prefixes")
-        allowed = {"time_head.2.weight", "time_head.2.bias"}
         if model.cfg.progress:
-            assert not (C["pg"] == PROG_UNKNOWN).any()
-            model.prog_dorm.requires_grad_(True)
-            known = torch.zeros_like(model.prog_dorm)
-            known[:PROG_UNKNOWN] = 1.0
-            ptrace = []
-            ptrace_loss = _fit(model, C, dev, [model.prog_dorm], prog_lr, steps, batch_rows, seed + 1,
-                               mask=lambda: model.prog_dorm.grad.mul_(known),
-                               after_step=lambda: (clamp_known_progress(model.prog_dorm),
-                                                   ptrace.append(model.prog_dorm.detach()[:PROG_UNKNOWN].clone())))
-            model.prog_dorm.requires_grad_(False)
-            after = _full_loss(model, C, dev)
-            pd = model.prog_dorm.detach()
-            info |= {"prog_lr": prog_lr, "prog_clamp": PROG_CLAMP, "prog_train_loss_after": after, "prog_trace": ptrace_loss,
-                     "prog_dorm_before": state0["prog_dorm"].tolist(), "prog_dorm_after": pd.tolist(),
-                     "prog_dorm_at_step": {s: ptrace[s].tolist() for s in (499, 999, 1999, steps - 1) if s < len(ptrace)},
-                     "prog_at_bound": int((pd[:PROG_UNKNOWN].abs() >= PROG_CLAMP).sum())}
-            allowed.add("prog_dorm")
-            log(f"  progress residuals [OUT, IN_exo] by state: {np.round(pd.cpu().numpy(), 2).tolist()}; "
-                f"train NLL {mid:.4f} -> {after:.4f}")
+            info |= _fit_progress(model, C, dev, steps, batch_rows, seed + 1, prog_lr, mid, log)
         sd = model.state_dict()
         for k, v in state0.items():  # nothing outside the refit rows moved
             if k == "time_head.2.weight":
@@ -168,6 +158,70 @@ def recalibrate_stop(model, store, views=None, dev="cuda", steps=4000, lr=1e-3, 
             else:
                 assert torch.equal(sd[k], v), k
         info["rows_changed"] = int(((sd["time_head.2.weight"] - state0["time_head.2.weight"]).abs().sum(1) > 0).sum())
+        return info
+    finally:
+        model.plan_inference = was_inference
+        for p, q in req.items():
+            p.requires_grad_(q)
+
+
+def _fit_progress(model, C, dev, steps, batch_rows, seed, prog_lr, before, log) -> dict:
+    """Refit the known-state rows of prog_dorm on the cache, everything else frozen, bounded by PROG_CLAMP."""
+    assert not (C["pg"] == PROG_UNKNOWN).any()
+    p0 = model.prog_dorm.detach().clone()
+    model.prog_dorm.requires_grad_(True)
+    known = torch.zeros_like(model.prog_dorm)
+    known[:PROG_UNKNOWN] = 1.0
+    ptrace = []
+    try:
+        ptrace_loss = _fit(model, C, dev, [model.prog_dorm], prog_lr, steps, batch_rows, seed,
+                           mask=lambda: model.prog_dorm.grad.mul_(known),
+                           after_step=lambda: (clamp_known_progress(model.prog_dorm),
+                                               ptrace.append(model.prog_dorm.detach()[:PROG_UNKNOWN].clone())))
+    finally:
+        model.prog_dorm.requires_grad_(False)
+    after = _full_loss(model, C, dev)
+    pd = model.prog_dorm.detach()
+    log(f"  progress residuals [OUT, IN_exo] by state: {np.round(pd.cpu().numpy(), 2).tolist()}; "
+        f"train NLL {before:.4f} -> {after:.4f}")
+    return {"prog_lr": prog_lr, "prog_clamp": PROG_CLAMP, "prog_train_loss_after": after, "prog_trace": ptrace_loss,
+            "prog_dorm_before": p0.tolist(), "prog_dorm_after": pd.tolist(),
+            "prog_dorm_at_step": {s: ptrace[s].tolist() for s in (499, 999, 1999, steps - 1) if s < len(ptrace)},
+            "prog_at_bound": int((pd[:PROG_UNKNOWN].abs() >= PROG_CLAMP).sum())}
+
+
+def refit_progress(model, store, dev="cuda", steps=4000, batch_rows=8192, seed=0, prog_lr: float = PROG_LR, log=print) -> dict:
+    """Refit only the known-state progress residuals of a progress model on the training split with the real s
+    (the second stage of recalibrate_stop, same seed / steps / lr / bound), in place; asserts nothing else moved.
+    Used for pace arms, whose shrinkage changes the finite gap law the residuals were fitted against."""
+    assert model.cfg.progress
+    was_inference, req = model.plan_inference, {p: p.requires_grad for p in model.parameters()}
+    model.eval()
+    try:
+        model.plan_inference = True
+        C = _cache(model, store, Views(store), dev)
+        model.plan_inference = False
+        for p in model.parameters():
+            p.requires_grad_(False)
+        state0 = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        if model.cfg.pace:
+            model.pace.reset_stats()
+        before = _full_loss(model, C, dev)
+        info = {"rows": len(C["t0"]), "steps": steps, "train_loss_before": before}
+        if model.cfg.pace:
+            info["eligible_rows"] = int(C["pe"].sum())
+        info |= _fit_progress(model, C, dev, steps, batch_rows, seed + 1, prog_lr, before, log)
+        if model.cfg.pace:
+            model.pace.reset_stats()
+            _full_loss(model, C, dev)
+            info["pace_stats_train"] = dict(model.pace.stats)
+            model.pace.reset_stats()
+        sd = model.state_dict()
+        for k, v in state0.items():
+            if k == "prog_dorm":
+                assert torch.equal(sd[k][PROG_UNKNOWN], v[PROG_UNKNOWN])
+            else:
+                assert torch.equal(sd[k], v), k
         return info
     finally:
         model.plan_inference = was_inference

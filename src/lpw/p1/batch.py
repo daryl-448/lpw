@@ -282,7 +282,8 @@ def collate(views: list[dict], specs: list[tuple[int, np.ndarray]], n_venues: in
     from lpw.p1.plan import N_PLAN_A, N_PLAN_N
     plan_n = np.array([v.get("plan_n", N_PLAN_N) for v in views], np.int64)  # absent = unknown
     plan_a = np.array([v.get("plan_a", N_PLAN_A) for v in views], np.int64)
-    out.update(tok_cont=cont, role=role, cohort=cohort, prof=prof, ocont=ocont, plan_n=plan_n, plan_a=plan_a)
+    origin = np.array([v["origin"] for v in views], np.int64)
+    out.update(tok_cont=cont, role=role, cohort=cohort, prof=prof, ocont=ocont, plan_n=plan_n, plan_a=plan_a, origin=origin)
     out.update({f"row_{k}": np.array(x, np.float64 if k in ("t0", "r") else np.int64) for k, x in rows.items()})
     out["o_row"] = np.array(orow["row"], np.int64)
     out["o_led"] = np.array(orow["led"], np.float32).reshape(-1, 2)

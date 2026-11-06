@@ -31,7 +31,7 @@ groups = groups_for(rag, edges)
 base = [dict(role=int(st.role[x]), cohort=int(st.cohort[x]), origin=int(st.origin[x]), prof=st.prof_vec(x), b0=float(st.b0[x]),
              age_days=float(st.prof_raw[x, 17])) for x in va]
 rng = np.random.default_rng(101)
-pops, plans = [], []
+pops, plans, plans_a = [], [], []
 if a.mode == "none":
     pops = [base] * a.seeds
 else:
@@ -42,9 +42,13 @@ else:
             pn, pa_ = st.plan_n[va], st.plan_a[va]
         else:
             pn, pa_ = prior.sample(st.role[va], st.cohort[va], np.stack([c["prof"] for c in base]), rng)
-        plans.append(pn)
+        plans.append(pn), plans_a.append(pa_)
         pops.append([{**c, "plan_n": int(n), "plan_a": int(m)} for c, n, m in zip(base, pn, pa_)])
+if getattr(model.cfg, "pace", False):
+    model.pace.reset_stats()
 reps, info = generate_replicas(model, pops, st, seed=7, log=lambda *x: None)
+if getattr(model.cfg, "pace", False):
+    info["pace_stats"] = dict(model.pace.stats)
 
 
 def per_agent(ev, n_agents):
@@ -82,7 +86,7 @@ def cut(ev, k):
     return ev.sort("agent", "ts").with_columns(pl.int_range(pl.len()).over("agent").alias("_k")).filter(pl.col("_k") < k).drop("_k")
 
 
-res = {"ckpt": a.ckpt, "model": a.model, "mode": a.mode, "gen_info": info}
+res = {"ckpt": a.ckpt, "model": a.model, "mode": a.mode, "save": a.save, "replicas": a.seeds, "gen_info": info}
 real_streams = [per_agent(rev, len(va))]
 syn_streams = [per_agent(e, len(va)) for _, e in reps]
 for ro, nm in ((0, "normal"), (1, "scam")):
@@ -112,6 +116,8 @@ for k in (int(x) for x in a.cuts.split(",")):
 if a.save:
     from lpw.p1.run import write_replicas
     write_replicas(reps, Path(a.save))
+    if plans:  # the per-replica joint plans, so later comparisons can share them exactly
+        np.savez(Path(a.save).with_suffix(".plans.npz"), plan_n=np.stack(plans), plan_a=np.stack(plans_a))
 if not a.no_nll:
     model.plan_inference = False
     e = evaluate(model, st, "val", views=views)["all"]

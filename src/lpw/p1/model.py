@@ -41,6 +41,7 @@ class Cfg:
     dropout: float = 0.1
     plan: bool = False     # per-agent plan latent through the PROFILE token (lpw.p1.plan)
     progress: bool = False  # plan progress state -> learned residual on the dormant-atom logit (needs plan)
+    pace: bool = False     # history-free pace reference + mean shrinkage of the time law (lpw.p1.pace; post-hoc only)
 
 
 CONFIGS = {
@@ -52,6 +53,7 @@ CONFIGS = {
     "b2": Cfg("b2", k_mix=1, b2=True),
     "lpw_plan": Cfg("lpw_plan", plan=True),
     "lpw_plan_prog": Cfg("lpw_plan_prog", plan=True, progress=True),
+    "lpw_plan_prog_pace": Cfg("lpw_plan_prog_pace", plan=True, progress=True, pace=True),
 }
 
 
@@ -150,6 +152,10 @@ class Model(nn.Module):
             assert cfg.plan, "progress needs the plan latent"
             from lpw.p1.plan import N_PROG
             self.prog_dorm = nn.Parameter(torch.zeros(N_PROG, 2))
+        if cfg.pace:
+            assert cfg.progress, "pace shrinkage is built on the progress model"
+            from lpw.p1.pace import PaceRef
+            self.pace = PaceRef(n_prof)
         # plan latent at inference: False = unknown (NLL evaluation; no future information), True = use B["plan_*"]
         self.plan_inference = False
         self.kind_head = mlp(d, d, 2)
@@ -193,7 +199,7 @@ class Model(nn.Module):
             elif not self.plan_inference:
                 pn, pa = torch.full_like(pn, N_PLAN_N), torch.full_like(pa, N_PLAN_A)
             p = p + self.e_plan_n(pn) + self.e_plan_a(pa)
-            B["_plan_n_eff"] = pn  # the effective plan (same dropout draw) for row_progress
+            B["_plan_n_eff"], B["_plan_a_eff"] = pn, pa  # the effective plan (same dropout draw) for row_progress / pace
         x = torch.cat([p[:, None], x[:, 1:]], 1)
         L = x.shape[1]
         x = x + self.pos(torch.arange(L, device=x.device))[None]
@@ -210,9 +216,18 @@ class Model(nn.Module):
         from lpw.p1.plan import progress_state
         return progress_state(B["_plan_n_eff"][B["row_b"]], B["row_nown"])
 
-    def kind_time(self, hk, ho, t0, prog=None):
+    def row_extras(self, B) -> dict:
+        """Row inputs kind_time needs beyond the hidden states: prog (progress models), pace (pace models)."""
+        out = {}
+        if self.cfg.progress:
+            out["prog"] = self.row_progress(B)
+        if self.cfg.pace:
+            out["pace"] = self.pace.features(B)
+        return out
+
+    def kind_time(self, hk, ho, t0, prog=None, pace=None):
         """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ). prog: row_progress, required for
-        progress models."""
+        progress models; pace: pace.features (x, eligible), required for pace models (see row_extras)."""
         logpk = torch.log_softmax(self.kind_head(hk), -1)
         n = hk.shape[0]
         inp = torch.cat([ho[:, None].expand(n, 2, -1), self.e_tkind.weight[None].expand(n, 2, -1)], -1)
@@ -224,7 +239,11 @@ class Model(nn.Module):
         lp = torch.log_softmax(out[:, :64], -1)
         lh = torch.log_softmax(out[:, 64:88], -1) if self.cfg.week else None
         ld = torch.log_softmax(out[:, 88:95], -1) if self.cfg.week else None
-        law = TimeLaw(lp, lh, ld, t0.repeat_interleave(2))
+        t0r = t0.repeat_interleave(2)
+        if self.cfg.pace:
+            assert pace is not None, "pace model: pass **model.row_extras(B)"
+            lp = self.pace.adapt(lp, lh, ld, t0, logpk, pace)
+        law = TimeLaw(lp, lh, ld, t0r)
         return logpk, law, out
 
     def time_emb(self, tbin, tmonth, tcont):
@@ -297,7 +316,7 @@ class Model(nn.Module):
         rb, rj, typ, t0, r = B["row_b"], B["row_j"], B["row_type"], B["row_t0"], B["row_r"]
         N = len(rb)
         hk, ho = Hk[rb, rj], Ho[rb, rj]
-        logpk, law, tout = self.kind_time(hk, ho, t0, self.row_progress(B) if self.cfg.progress else None)
+        logpk, law, tout = self.kind_time(hk, ho, t0, **self.row_extras(B))
         own = typ == 1
         cen = (typ == 2) | (typ == 3)
         tk = B["row_tkind"].clamp(min=0)
