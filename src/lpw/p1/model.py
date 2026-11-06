@@ -39,6 +39,8 @@ class Cfg:
     heads: int = 4
     ff: int = 512
     dropout: float = 0.1
+    pos: str = "abs"       # abs = learned absolute window positions | alibi = per-head linear recency bias on event-event attention
+    indep_init: bool = False  # re-initialise each transformer layer independently (nn.TransformerEncoder deep-copies one layer)
     plan: bool = False     # per-agent plan latent through the PROFILE token (lpw.p1.plan)
     progress: bool = False  # plan progress state -> learned residual on the dormant-atom logit (needs plan)
     pace: bool = False     # history-free pace reference + mean shrinkage of the time law (lpw.p1.pace; post-hoc only)
@@ -56,6 +58,10 @@ CONFIGS = {
     "lpw_plan_prog": Cfg("lpw_plan_prog", plan=True, progress=True),
     "lpw_plan_prog_pace": Cfg("lpw_plan_prog_pace", plan=True, progress=True, pace=True),
     "lpw_plan_prog_anchor": Cfg("lpw_plan_prog_anchor", plan=True, progress=True, anchor=True),
+    # encoder screen (reports/p1_encoder_screen.md)
+    "tf_ref": Cfg("tf_ref", indep_init=True),
+    "tf_alibi": Cfg("tf_alibi", pos="alibi", indep_init=True),
+    "tf_small": Cfg("tf_small", layers=2, ff=128, indep_init=True),
 }
 
 
@@ -130,11 +136,20 @@ class Model(nn.Module):
         self.e_role = nn.Embedding(2, d)
         self.e_cohort = nn.Embedding(2, d)
         self.prof_mlp = mlp(n_prof + 6, d, d)
-        self.pos = nn.Embedding(CTX + 1, d)
+        if cfg.pos == "abs":
+            self.pos = nn.Embedding(CTX + 1, d)
         if cfg.enc == "tf":
             layer = nn.TransformerEncoderLayer(d, cfg.heads, cfg.ff, cfg.dropout, batch_first=True, norm_first=True)
             self.enc = nn.TransformerEncoder(layer, cfg.layers, enable_nested_tensor=False)
             self.ln = nn.LayerNorm(d)
+            if cfg.indep_init:
+                for lay in self.enc.layers:
+                    lay.self_attn._reset_parameters()
+                    for mod in (lay.linear1, lay.linear2, lay.norm1, lay.norm2):
+                        mod.reset_parameters()
+            if cfg.pos == "alibi":
+                h = cfg.heads
+                self.register_buffer("alibi_slopes", torch.tensor([2.0 ** (-8.0 * (i + 1) / h) for i in range(h)]), persistent=False)
         elif cfg.enc == "gru":
             self.enc = nn.GRU(d, d, 2, batch_first=True, dropout=cfg.dropout)
             self.ln = nn.LayerNorm(d)
@@ -209,13 +224,27 @@ class Model(nn.Module):
             B["_plan_n_eff"], B["_plan_a_eff"] = pn, pa  # the effective plan (same dropout draw) for row_progress / pace
         x = torch.cat([p[:, None], x[:, 1:]], 1)
         L = x.shape[1]
-        x = x + self.pos(torch.arange(L, device=x.device))[None]
-        if self.cfg.enc == "tf":
+        if self.cfg.pos == "alibi" and self.cfg.enc == "tf":
+            h = self.ln(self.enc(x, mask=self.alibi_mask(x.shape[0], L, x.device, x.dtype)))
+        elif self.cfg.enc == "tf":
+            x = x + self.pos(torch.arange(L, device=x.device))[None]
             mask = nn.Transformer.generate_square_subsequent_mask(L, device=x.device)
             h = self.ln(self.enc(x, mask=mask, is_causal=True))
         else:
+            x = x + self.pos(torch.arange(L, device=x.device))[None]
             h = self.ln(self.enc(x)[0])
         return h, h
+
+    def alibi_mask(self, B, L, dev, dtype):
+        """(B * heads, L, L) additive mask: causal, -slope_h x (i - j) between event tokens, no penalty on attention to
+        the PROFILE token (position 0), so profile / plan conditioning stays globally accessible. No position
+        embeddings are added in this mode."""
+        i = torch.arange(L, device=dev)
+        dist = (i[:, None] - i[None, :]).to(dtype)
+        bias = -self.alibi_slopes.to(dtype)[:, None, None] * dist[None]
+        bias[:, :, 0] = 0.0
+        bias = bias.masked_fill((i[None, :] > i[:, None])[None], float("-inf"))
+        return bias.repeat(B, 1, 1)
 
     # ---- heads ---------------------------------------------------------------------------------------------
     def row_progress(self, B):
