@@ -510,12 +510,22 @@ The estimates are for the GTX 1650 Super. Each one is replaced by a measurement 
 | Phase | Work | Exit criteria | Est. wall time | Where |
 |---|---|---|---|---|
 | **P0** Data audit + pilot slices (**done** for 2021 and 2018, §5.2) | Set up the environment (uv, Python 3.12, PyTorch CUDA on sm_75, fp16 smoke test). Download W months (~6 GB for 2021, 1.5 GB for 2018) plus labels and daily feature records. Build agent streams, cohorts, profiles, venues, groups and splits (§5.4 order). Re-verify §5.1. Measure: negative-balance rate, `activity_end_ts` vs last edge, daily-file coverage, group sizes and purity, hub label mix, age-only AUC in W, matched-sample size (§7.5), training throughput. | Slice built. Audit report written. §5 updated with the measured numbers. | 1–2 h (mostly download) | local |
-| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | On each slice: beats B0 and B1 on held-out full-event NLL. Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | Minutes per training run (measured: about 7 s per epoch per slice); ≤ 4 h for the whole phase grid across both slices | local |
+| **P1** Next-event predictor → single-agent generator | Policy model, B0–B2, ablations A1 and A3 (A4 optional), profile generator, M1–M16. | On each slice: beats B0 on held-out full-event NLL. Non-inferior to B1 on held-out full-event NLL: the one-sided 95% upper bound of LPW − B1 (paired bootstrap over whole groups) is ≤ +0.03 nats per owned event. Generates better than B1: in each role, LPW's mean M1–M16 pass rate over the same generation replicas is above B1's (amendment A1). Beats B2 on the NLL of the fields both models have (kind, time including censored terms, amount). Every model is scored on identical evaluation prefixes. At least 70% of M1–M16 pass at ≤ 2× noise floor for each role. Role-AUC within ±0.05 of real. | Minutes per training run (measured: about 7 s per epoch per slice); ≤ 4 h for the whole phase grid across both slices | local |
 | **P2** Latent types | Encoder, GMM, `z`-conditioning, ablation against no-`z`. | Keep `z` only if M9–M16 or role parity improve on validation, with nothing getting worse beyond noise. Otherwise drop it and record why. | ≤ 1 h | local |
 | **P3** World | Groups, AGENT class, engine, ledger, inventory, O, labels, §7.3 and §7.4. | On each slice, §7.3 metrics reported against that slice's `R_W`. With confounder features removed, the excess-AUC ratio `(AUC_TSTR − 0.5) / (AUC_TRTR − 0.5)` is ≥ 0.8 (initial target). This gate only counts when `AUC_TRTR − 0.5 ≥ 0.1`; otherwise the result is reported as not testable. Seam test and shortcut audit pass. The §7.5 matched utility result comes from the 2018 slice. | Sequential simulation per slice (7.2k agents in 2021 and 24.9k in 2018, each about 0.48M events at the measured 1.66 ms per batch-1 pass, plus overhead): 15–30 min each. GNN detector: 1–3 h. | local; GNN borderline |
 | **P5** Scale-up | Multiple eras (2017–2025, about 21 GB), all non-hub seeds in one model with an era covariate, which tests transfer across eras. Contracts become passive sinks. | P1 and P3 metrics hold in each era. | Data build 2–4 h; training 1–3 h; simulation 3–8 h | **likely cloud** |
 
 P4 is intentionally absent: hardening moved to future work (§10).
+
+**Amendment A1 (2026-11-06): B1 criterion of P1.**
+- **Original wording:** "beats B0 and B1 on held-out full-event NLL".
+- **What prompted it:** the pre-registered encoder screen (`reports/p1_encoder_screen.md`) failed its B1 margin.
+  - On val, ALiBi − B1 was +0.017 and +0.023 nats per owned event over two seeds.
+  - B1 generated much worse populations: normal M-pass 0.19 vs 0.50, with capped streams.
+- **Why the criterion changed:** better likelihood than a GRU with the same heads is not what the simulator is for. Generation fidelity is.
+- **Disclosure:** the change was made after seeing those results. It was decided with the user and a Sol design round.
+- **Reporting:** every P1 result also reports the original criterion, which is currently unmet.
+- **Unchanged:** §6.3 (still a transformer) and every other exit criterion.
 
 ## 9. Compute policy
 
