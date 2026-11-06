@@ -32,6 +32,7 @@ import numpy as np
 import polars as pl
 import torch
 
+from lpw.p1.atomic import atomic_path, write_text
 from lpw.p1.batch import CTX, Views, collate, to_torch
 from lpw.p1.store import IN_AGENT, NEW, OUT, PERIPHERY, TIER_VENUE, VENUE, build_store, derived
 from lpw.p1.timelaw import EDGES, TimeLaw, dt_bin
@@ -166,7 +167,7 @@ def say(s=""):
 
 def save():
     if outp:
-        Path(outp).write_text("\n".join(lines) + "\n")
+        write_text(outp, "\n".join(lines) + "\n")
 
 
 role, plan = st.role[va], st.plan_n[va]
@@ -207,7 +208,8 @@ if "--sens-only" not in flags:
                           "elapsed": [x[4] for x in recs], **{k: v for k, v in F.items()}})
         R = R.with_columns(pl.Series("role", role[R["i"].to_numpy()]), pl.Series("plan", plan[R["i"].to_numpy()]),
                            pl.Series("noin", no_inag[R["i"].to_numpy()]))
-        R.write_parquet(str(CACHE))
+        with atomic_path(CACHE) as t:
+            R.write_parquet(str(t))
     say(f"(1) paired forecasts, real vs generated prefix of the same agent and depth ({ck}; {gpath}); plan >= 10")
     say("    pairs = (agent, replica) with both prefixes; reach = generated pairs / (agents x replicas); means over pairs;")
     say("    dElog = syn - real with a 95% whole-group bootstrap interval")
@@ -265,7 +267,8 @@ M = pl.DataFrame({"i": [x[0] for x in meta], "d": [x[1] for x in meta], "kind": 
 M = M.join(M.filter(pl.col("kind") == "base").select("i", "d", pl.col("elog").alias("e0"), pl.col("elog_neutral").alias("n0")), on=["i", "d"])
 M = M.with_columns(pl.Series("role", role[M["i"].to_numpy()]), pl.Series("plan", plan[M["i"].to_numpy()]),
                    ((pl.col("elog") - pl.col("e0")) / pl.col("dx")).alias("e"))
-M.write_parquet(str(ck / "feedback_sens.parquet"))
+with atomic_path(ck / "feedback_sens.parquet") as t:
+    M.write_parquet(str(t))
 for ro, rn in ((0, "normal"), (1, "scam")):
     say(f"  {rn}: d   cal_lam 2/3          cal_lam 3/2          lam 2/3 (time-consistent)   recent-gap response   (rows)")
     for d in DEPTHS[2:]:
@@ -289,7 +292,7 @@ if ctrl is not None:
     say(f"  vs control {ctrl}: mean e {j['e'].mean():+.3f} vs {j['e_ctrl'].mean():+.3f}, reduction {rel:.3f}; "
         f"paired difference {fmt(pdiff)}")
 import json as _json
-(ck / "feedback_sens.json").write_text(_json.dumps(SENS, indent=1))
+write_text(ck / "feedback_sens.json", _json.dumps(SENS, indent=1))
 save()
 
 # ---- (3) timing vs marks ----

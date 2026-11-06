@@ -103,7 +103,12 @@ class PaceRef(nn.Module):
     # ---- shrinkage -----------------------------------------------------------------------------------------
     def adapt(self, lp, lh, ld, t0, logpk, pace) -> torch.Tensor:
         """lp, lh, ld: the model's (2N, ·) log-probabilities (rows 2i + kind); returns float64 log_pdt for TimeLaw,
-        tilted on eligible rows, bit-identical (lp.double()) elsewhere."""
+        tilted on valid eligible rows, bit-identical (lp.double()) elsewhere.
+
+        Phase 1 (no autograd, all eligible rows): the root theta0 and validity (finite model law, reference law,
+        target, root and slope). Phase 2 (differentiable, valid rows only): the tilt, with the implicit-function
+        gradient of the root. Invalid rows never enter the graph, so they are hard bypasses; both phases run in
+        grad and no-grad mode alike, so the forward values are identical."""
         x, elig = pace
         lp64 = lp.double()
         n = len(t0)
@@ -113,51 +118,68 @@ class PaceRef(nn.Module):
             return lp64
         assert bool(self.fitted), "PaceRef not fitted"
         idx = torch.nonzero(elig)[:, 0]
-        r2 = torch.stack([2 * idx, 2 * idx + 1], 1).reshape(-1)
-        t0e = t0[idx]
-        base = TimeLaw(lp64[r2], lh[r2], ld[r2], t0e.repeat_interleave(2))
-        ell = bin_log_moments(base)                                       # (2n, 62)
-        logm = torch.log(base.mass.clamp(min=1e-300))
-        Mb, Zb = base.mass.sum(-1), base.Z
-        pk = logpk[idx].double()
+        self.stats["eligible"] += len(idx)
         with torch.no_grad():
+            r2 = _rows2(idx)
+            t0e = t0[idx].double()
+            base = TimeLaw(lp64[r2], lh[r2], ld[r2], t0e.repeat_interleave(2))
+            ell = bin_log_moments(base)
+            logm = torch.log(base.mass.clamp(min=1e-300))
+            Mb, Zb = base.mass.sum(-1), base.Z
+            pk = logpk[idx].double()
             lpr, ref = self.law(x[idx], t0e)
             mu_r, _ = _pos_mean(torch.log(ref.mass.clamp(min=1e-300)), bin_log_moments(ref), ref.mass.sum(-1), ref.Z, lpr.double())
             mu_h0, pi0 = _pos_mean(logm, ell, Mb, Zb, pk)
             target0 = g * mu_h0 + (1.0 - g) * mu_r
-            valid = torch.isfinite(target0) & torch.isfinite(mu_h0) & torch.isfinite(pi0).all(-1)
-            target0 = torch.where(valid, target0, torch.zeros_like(target0))
-            theta0, clipped = _solve_theta(logm, ell, torch.where(valid[:, None], pi0, 0.5), target0)
-            valid = valid & torch.isfinite(theta0)
-            theta0 = torch.where(valid, theta0, torch.zeros_like(theta0))  # invalid rows: no tilt
-            interior = valid & ~clipped
+            per_kind = lambda v: v.view(-1, 2).all(-1)
+            valid = (per_kind(torch.isfinite(logm).all(-1) & torch.isfinite(ell).all(-1) & torch.isfinite(Mb) & torch.isfinite(Zb) & (Zb > 0))
+                     & torch.isfinite(pk).all(-1) & torch.isfinite(t0e) & torch.isfinite(mu_r)
+                     & torch.isfinite(target0) & torch.isfinite(mu_h0) & torch.isfinite(pi0).all(-1))
+            v2 = valid.repeat_interleave(2)[:, None]
+            logm_s, ell_s = torch.where(v2, logm, 0.0), torch.where(v2, ell, 0.0)
+            pi_s, target_s = torch.where(valid[:, None], pi0, 0.5), torch.where(valid, target0, 0.0)
+            theta0, clipped = _solve_theta(logm_s, ell_s, pi_s, target_s)
             # dF/dtheta at the root, F = tilted mean - target: sum_k pi_k Var_tilted_k(ell)
-            q = torch.softmax(logm + theta0.repeat_interleave(2)[:, None] * ell, -1)
-            var = (q * ell * ell).sum(-1) - (q * ell).sum(-1) ** 2
-            f_th = (pi0 * var.view(-1, 2)).sum(-1)
-            self.stats["eligible"] += len(idx)
+            q = torch.softmax(logm_s + theta0.repeat_interleave(2)[:, None] * ell_s, -1)
+            var = (q * ell_s * ell_s).sum(-1) - (q * ell_s).sum(-1) ** 2
+            f_th = (pi_s * var.view(-1, 2)).sum(-1)
+            valid = valid & torch.isfinite(theta0) & torch.isfinite(f_th)
             self.stats["clipped"] += int((valid & clipped).sum())
             self.stats["invalid"] += int((~valid).sum())
-            self.stats["abs_theta_sum"] += float(theta0.abs().sum())
-            self.stats["shift_sum"] += float((target0 - mu_h0).sum())
-        theta = theta0
-        sel = interior & (f_th > 1e-12)
-        if torch.is_grad_enabled() and logm.requires_grad and bool(sel.any()):
+            self.stats["abs_theta_sum"] += float(theta0[valid].abs().sum())
+            self.stats["shift_sum"] += float((target0 - mu_h0)[valid].sum())
+        if not bool(valid.any()):
+            return lp64
+        iv, th0, mu_rv, f_v = idx[valid], theta0[valid], mu_r[valid], f_th[valid]
+        sel = ~clipped[valid] & (f_v > 1e-12)
+        r2 = _rows2(iv)
+        base = TimeLaw(lp64[r2], lh[r2], ld[r2], t0[iv].double().repeat_interleave(2))
+        ell = bin_log_moments(base)                                       # (2n, 62)
+        logm = torch.log(base.mass.clamp(min=1e-300))
+        Mb, Zb = base.mass.sum(-1), base.Z
+        pk = logpk[iv].double()
+        theta = th0
+        if torch.is_grad_enabled() and (logm.requires_grad or pk.requires_grad) and bool(sel.any()):
             # implicit-function gradient of the root (theta depends on the model through mu_h and the kinds' shares
-            # pi of positive-finite gaps): value theta0, derivative -dF/dphi / dF/dtheta. Computed on interior rows
-            # only, so clipped / invalid rows get a zero derivative and cannot leak NaN gradients.
+            # pi of positive-finite gaps): value theta0, derivative -dF/dphi / dF/dtheta. Interior rows only:
+            # clipped rows get a zero derivative.
             j = torch.nonzero(sel)[:, 0]
-            j2 = torch.stack([2 * j, 2 * j + 1], 1).reshape(-1)
+            j2 = _rows2(j)
             mu_h, pi = _pos_mean(logm[j2], ell[j2], Mb[j2], Zb[j2], pk[j])
-            F = _tilted_mean(logm[j2], ell[j2], pi, theta0[j]) - (g * mu_h + (1.0 - g) * mu_r[j])
-            theta = theta0.clone()
-            theta[j] = theta0[j] - (F - F.detach()) / f_th[j]
+            F = _tilted_mean(logm[j2], ell[j2], pi, th0[j]) - (g * mu_h + (1.0 - g) * mu_rv[j])
+            theta = th0.clone()
+            theta[j] = th0[j] - (F - F.detach()) / f_v[j]
         th = theta.repeat_interleave(2)[:, None]
         logM = torch.logsumexp(logm, -1, keepdim=True)
         c = logM - torch.logsumexp(logm + th * ell, -1, keepdim=True)     # keeps each kind's positive-finite mass
         out = lp64.clone()
         out[r2, 1:63] = lp64[r2, 1:63] + th * ell + c
         return out
+
+
+def _rows2(idx):
+    """row indices 2i, 2i + 1 (both kinds) of the given rows, interleaved."""
+    return torch.stack([2 * idx, 2 * idx + 1], 1).reshape(-1)
 
 
 def bin_log_moments(law: TimeLaw) -> torch.Tensor:
@@ -378,6 +400,7 @@ def main():
     """Build the pace arms from a recalibrated lpw_plan_prog checkpoint: fit the reference once, then for each
     gamma refit the known-state progress residuals (recal.refit_progress) with the shrinkage active."""
     import argparse
+    from lpw.p1.atomic import atomic_path, write_text
     from lpw.p1.model import CONFIGS, Model
     from lpw.p1.recal import refit_progress
     from lpw.p1.store import build_store
@@ -405,8 +428,9 @@ def main():
         fit = json.loads((root / "pace_ref.json").read_text())
     else:
         fit = fit_reference(model, st, dev)
-        torch.save(model.pace.state_dict(), ref_path)
-        (root / "pace_ref.json").write_text(json.dumps(fit, indent=1))
+        with atomic_path(ref_path) as t:
+            torch.save(model.pace.state_dict(), t)
+        write_text(root / "pace_ref.json", json.dumps(fit, indent=1))
     print(f"reference: train NLL {fit['train_nll']:.4f} (kind + time + cens), {fit['rounds']} L-BFGS rounds")
     if a.ref_only:
         return
@@ -424,14 +448,15 @@ def main():
         u1 = unknown_terms(m, st)
         assert u1["complete"] and u1["rows"] == u0["rows"] and torch.equal(u0["terms"], u1["terms"]), "s-unknown terms changed"
         kn = known_plan_nll(m, st)
-        torch.save(m.state_dict(), out / "model.pt")
+        with atomic_path(out / "model.pt") as t:
+            torch.save(m.state_dict(), t)
         shutil.copy(base_dir / "train.json", out / "train.json")
         rec = {"base": str(base_dir), "gamma": g, "reference": {k: v for k, v in fit.items() if k != "trace"}, "refit_progress": info,
                "unknown_bit_identical": True, "unknown_check": {"split": "val", "prefixes": u0["rows"], "batches": u0["batches"],
                                                          "terms": int(u0["terms"].numel()), "complete": True}, "known_plan_nll_base": kn_base, "known_plan_nll": kn,
                "known_plan_nll_delta": {r: kn[r]["full"] - kn_base[r]["full"] for r in kn}}
-        (out / "recal.json").write_text(json.dumps({"note": "staged pace arm; see pace.json"}, indent=1))
-        (out / "pace.json").write_text(json.dumps(rec, indent=1))
+        write_text(out / "recal.json", json.dumps({"note": "staged pace arm; see pace.json"}, indent=1))
+        write_text(out / "pace.json", json.dumps(rec, indent=1))  # last: marks the arm complete
         print(f"gamma {g}: known-plan val NLL delta {rec['known_plan_nll_delta']}, residuals {info['prog_dorm_after']}")
 
 

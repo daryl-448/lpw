@@ -13,6 +13,7 @@ from lpw.p1.evaluate import evaluate
 from lpw.p1.fidelity import Sample, compare, groups_for, real_frames
 from lpw.p1.run import generate_replicas, average_fidelity
 from lpw.p1.plan import PlanPrior, count_bucket
+from lpw.p1.atomic import atomic_path, write_text
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", required=True); ap.add_argument("--model", default="lpw"); ap.add_argument("--mode", default="none")
@@ -117,12 +118,13 @@ if a.save:
     from lpw.p1.run import write_replicas
     write_replicas(reps, Path(a.save))
     if plans:  # the per-replica joint plans, so later comparisons can share them exactly
-        np.savez(Path(a.save).with_suffix(".plans.npz"), plan_n=np.stack(plans), plan_a=np.stack(plans_a))
+        with atomic_path(Path(a.save).with_suffix(".plans.npz")) as t, open(t, "wb") as f:
+            np.savez(f, plan_n=np.stack(plans), plan_a=np.stack(plans_a))
 if not a.no_nll:
     model.plan_inference = False
     e = evaluate(model, st, "val", views=views)["all"]
     res["val_nll"] = {k: e[k] for k in ("nll_full", "nll_shared", "nll_kind", "nll_time", "nll_cens", "nll_cp", "nll_amt")}
 res["sec"] = round(time.time() - t_start)
 Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-Path(a.out).write_text(json.dumps(res, indent=1, default=float))
+write_text(a.out, json.dumps(res, indent=1, default=float))
 print(json.dumps({k: v for k, v in res.items() if k not in ("gen_info",)}, indent=1, default=float))

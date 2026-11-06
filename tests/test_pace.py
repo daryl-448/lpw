@@ -161,3 +161,62 @@ def test_non_finite_reference_rows_are_bypassed_without_nan_gradients():
     assert torch.isfinite(new).all() and ref.stats["invalid"] == int(pace[1].sum())
     (g,) = torch.autograd.grad(new.sum(), lp)
     assert torch.isfinite(g).all()
+
+
+def test_non_finite_model_rows_are_untouched_and_gradients_stay_finite():
+    ref = _ref(seed=3, gamma=0.5)
+    lp, lh, ld, t0, logpk, pace = _inputs(n=12)
+    x, elig = pace
+    bad = int(torch.nonzero(elig)[0, 0])
+    lh = lh.clone()
+    lh[2 * bad, 5] = float("nan")  # one weekly-logit row of one eligible prefix
+    lp = lp.double().requires_grad_(True)
+    ref.reset_stats()
+    new = ref.adapt(lp, lh, ld, t0, logpk, pace)
+    assert ref.stats["invalid"] == 1
+    rows = torch.tensor([2 * bad, 2 * bad + 1])
+    assert torch.equal(new[rows], lp.double()[rows])
+    assert torch.isfinite(new).all()
+    (g,) = torch.autograd.grad(new.sum(), lp)
+    assert torch.isfinite(g).all()
+
+
+def test_kind_only_gradient_through_the_root_matches_finite_differences():
+    """time heads frozen, kind logits trainable: theta still depends on the kinds' shares pi"""
+    from lpw.p1.pace import row_nll
+    ref = _ref(seed=2, gamma=0.5)
+    n = 30
+    g = torch.Generator().manual_seed(9)
+    lp = torch.log_softmax(torch.randn(2 * n, 64, generator=g, dtype=torch.float64) * 1.5, -1)
+    lh = torch.log_softmax(torch.randn(2 * n, 24, generator=g, dtype=torch.float64), -1)
+    ld = torch.log_softmax(torch.randn(2 * n, 7, generator=g, dtype=torch.float64), -1)
+    t0 = torch.tensor(np.linspace(W0 + 5000, W1 - 86400 * 30, n)).double()
+    k0 = torch.randn(n, 2, generator=g, dtype=torch.float64)
+    x = torch.rand(n, n_features(N_PROF), generator=g, dtype=torch.float64)
+    elig = torch.ones(n, dtype=torch.bool)
+    r = torch.exp(torch.rand(n, generator=g, dtype=torch.float64) * 15)
+    typ = torch.where(torch.rand(n, generator=g) < 0.7, 1, 3)
+    tk = (torch.rand(n, generator=g) < 0.4).long()
+
+    def loss(kb):
+        logpk = torch.log_softmax(k0 + torch.stack([torch.zeros(n, dtype=torch.float64), kb.expand(n)], 1), -1)
+        new = ref.adapt(lp, lh, ld, t0, logpk, (x, elig))
+        return row_nll(logpk, TimeLaw(new, lh, ld, t0.repeat_interleave(2)), r, typ, tk).sum()
+
+    kb = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+    ref.reset_stats()
+    gr = torch.autograd.grad(loss(kb), kb)[0]
+    assert ref.stats["clipped"] == 0 and ref.stats["invalid"] == 0
+    h = 1e-5
+    with torch.no_grad():
+        fd = (loss(kb + h) - loss(kb - h)) / (2 * h)
+    assert torch.allclose(gr, fd, rtol=1e-5, atol=1e-7), (gr, fd)
+
+
+def test_grad_and_no_grad_forwards_are_bit_identical():
+    ref = _ref(seed=4, gamma=0.5)
+    lp, lh, ld, t0, logpk, pace = _inputs(n=24)
+    with torch.no_grad():
+        a = ref.adapt(lp, lh, ld, t0, logpk, pace)
+    b = ref.adapt(lp.double().requires_grad_(True), lh, ld, t0, logpk.requires_grad_(True), pace)
+    assert torch.equal(a, b.detach())

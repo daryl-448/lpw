@@ -178,7 +178,9 @@ def generate_replicas(model, pops: list[list[dict]], store, seed, log):
 
 
 def write_replicas(reps, path: Path):
-    pl.concat([e.with_columns(pl.lit(r, pl.Int16).alias("replica")) for r, (_, e) in enumerate(reps)]).write_parquet(path)
+    from lpw.p1.atomic import atomic_path
+    with atomic_path(path) as t:
+        pl.concat([e.with_columns(pl.lit(r, pl.Int16).alias("replica")) for r, (_, e) in enumerate(reps)]).write_parquet(t)
 
 
 def average_fidelity(fids: list[dict]) -> dict:

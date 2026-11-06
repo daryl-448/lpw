@@ -63,11 +63,15 @@ same-second share, events per active day, cut-k M-pass.
 ## Selection and what follows
 
 The selected arm is the largest gamma passing every gate (0.75 before 0.5); if none passes, pace shrinkage is
-rejected. An arm is rejected at its first failing gate and pending while any input it needs is missing; while a
-larger gamma is pending, the selection is pending (a smaller gamma is never selected early). Inputs are checked for
+rejected. Gates are evaluated one by one, each as pass, fail or missing (an input file or field absent or partially
+written). Within a stage (L + O, then P), an arm is rejected if any gate fails, even when another gate's input is
+missing; otherwise it is pending while any gate is missing. P gates are evaluated only for arms passing every L and
+O gate. While a larger gamma is pending, the selection is pending (a smaller gamma is never selected early). Inputs are checked for
 provenance: each score file must name the gamma = 1 arm as its control and map every label to that arm's own
 generation (`gen_pace_g{gamma}_{mode}.parquet`, matching the `--save` path in its drift_exp output, which must name
-`lpw_pace_g{gamma}`), and each arm's mechanism comparison must be against `lpw_pace_g1.00`. A mismatch is an error. A selected arm is a candidate only: it goes to a three-training-seed confirmation against matched controls
+`lpw_pace_g{gamma}`; the control's mapping is checked like every arm's), each arm's mechanism comparison must be
+against `lpw_pace_g1.00`, and every generation (drift_exp metadata, score metadata, per-replica endpoint arrays) must
+have exactly five replicas. A mismatch is an error, not a gate outcome. A selected arm is a candidate only: it goes to a three-training-seed confirmation against matched controls
 (with the user's OK), and the P1 exit criteria (SPEC §8: likelihood wins over B0/B1/B2, >= 70% M-pass per role,
 role-AUC parity within 0.05, both slices) are unchanged. The test split stays sealed. Selection is applied by
 `scripts/p1_pace/paceselect.py`, which encodes exactly these thresholds (fixture tests: `tests/test_paceselect.py`).

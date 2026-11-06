@@ -58,6 +58,13 @@ def run(root):
     return subprocess.run([sys.executable, str(SCRIPT), str(root)], capture_output=True, text=True)
 
 
+def gate(r, arm, name):
+    """PASS / FAIL / MISSING of one gate of one arm in the script output"""
+    block = r.stdout.split(f"== {arm}\n")[1].split("\n== ")[0]
+    line = next(l for l in block.splitlines() if f" {name}:" in l)
+    return line.split()[0]
+
+
 def test_all_pass_selects_the_largest_gamma(tmp_path):
     build(tmp_path)
     r = run(tmp_path)
@@ -71,14 +78,14 @@ def test_smaller_gamma_is_not_selected_while_a_larger_one_is_pending(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "selection pending: g0.75" in r.stdout and "selected:" not in r.stdout
     g75, g50 = r.stdout.split("== g0.50")
-    assert "-> pending (needs" in g75 and "-> pass" in g50
+    assert "-> pending" in g75 and gate(r, "g0.75", "P1 survival") == "MISSING" and "-> pass" in g50
 
 
 def test_rejected_larger_gamma_falls_through(tmp_path):
     build(tmp_path, prior_labels=("g1.00", "g0.50"))
     edit(tmp_path / "pacescore_pace_oracle.json", lambda d: d["vs_control"]["g0.75"].update(rel_reduction=0.1))
     r = run(tmp_path)
-    assert "FAIL  O1 pace score" in r.stdout and "selected: g0.50" in r.stdout
+    assert gate(r, "g0.75", "O1 pace score") == "FAIL" and "selected: g0.50" in r.stdout
 
 
 def test_non_finite_endpoint_fails_closed(tmp_path):
@@ -87,7 +94,7 @@ def test_non_finite_endpoint_fails_closed(tmp_path):
         d["arms"]["g0.75"]["endpoint_reps"]["scam"]["7"][2] = float("nan")
     edit(tmp_path / "pacescore_pace_oracle.json", nan)
     r = run(tmp_path)
-    assert "FAIL  O4 endpoint" in r.stdout and "non-finite" in r.stdout
+    assert gate(r, "g0.75", "O4 endpoint") == "FAIL" and "non-finite" in r.stdout
 
 
 def test_control_spread_bound_binds_before_the_guard(tmp_path):
@@ -99,11 +106,40 @@ def test_control_spread_bound_binds_before_the_guard(tmp_path):
         a["endpoint_reps"]["normal"]["30"] = [v + 0.02 for v in a["endpoint_reps"]["normal"]["30"]]
     edit(tmp_path / "pacescore_pace_oracle.json", up)
     r = run(tmp_path)
-    assert "FAIL  O4 endpoint" in r.stdout and "selected: g0.50" in r.stdout
+    assert gate(r, "g0.75", "O4 endpoint") == "FAIL" and "selected: g0.50" in r.stdout
+
+
+def test_failing_gate_rejects_even_when_another_input_is_missing(tmp_path):
+    build(tmp_path)
+    edit(tmp_path / "pacescore_pace_oracle.json", lambda d: d["vs_control"]["g0.75"].update(rel_reduction=0.1))
+    (tmp_path / "lpw_pace_g0.75" / "feedback_sens.json").unlink()
+    r = run(tmp_path)
+    assert gate(r, "g0.75", "O2 mechanism") == "MISSING" and "-> rejected" in r.stdout and "selected: g0.50" in r.stdout
+
+
+def test_partial_inputs_are_pending_not_crashes(tmp_path):
+    build(tmp_path)
+    p = tmp_path / "drift_pace_g0.75_prior.json"
+    p.write_text(p.read_text()[:200])  # truncated write
+    r = run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert gate(r, "g0.75", "P1 survival") == "MISSING" and "selection pending: g0.75" in r.stdout
+    root2 = tmp_path / "b"
+    root2.mkdir()
+    build(root2)
+    edit(root2 / "pacescore_pace_oracle.json", lambda d: d["arms"]["g0.75"].pop("endpoint_reps"))
+    r = run(root2)
+    assert r.returncode == 0, r.stderr
+    assert gate(r, "g0.75", "O4 endpoint") == "MISSING" and "endpoint_reps" in r.stdout and "selection pending: g0.75" in r.stdout
 
 
 def test_wrong_controls_are_errors(tmp_path):
     for target, fn in [
+        ("pacescore_pace_oracle.json", lambda d: d["arm_paths"].pop("g1.00")),
+        ("pacescore_pace_oracle.json", lambda d: d["arm_paths"].update({"g1.00": "/elsewhere/gen_pace_g1.00_oracle.parquet"})),
+        ("pacescore_pace_oracle.json", lambda d: d["replicas"].update({"g0.75": 2})),
+        ("pacescore_pace_oracle.json", lambda d: d["arms"]["g1.00"]["endpoint_reps"]["normal"].update({"30": [0.1, 0.1]})),
+        ("drift_pace_g0.75_oracle.json", lambda d: d.update(replicas=2)),
         ("pacescore_pace_prior.json", lambda d: d.update(control="g0.75")),
         ("pacescore_pace_prior.json", lambda d: d["vs_control"]["g0.75"].update(control="other")),
         ("lpw_pace_g0.75/feedback_sens.json", lambda d: d.update(control="runs/elsewhere/lpw_pace_g1.00")),

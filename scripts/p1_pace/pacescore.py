@@ -19,6 +19,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import wasserstein_distance
 
+from lpw.p1.atomic import write_text
 from lpw.p1.fidelity import real_frames
 from lpw.p1.plan import count_bucket
 from lpw.p1.store import build_store
@@ -156,6 +157,6 @@ if len(arm_data) > 1:
         say(f"  {arm['label']}: improvement {score(arm_data[0]) - score(arm):+.4f} (95% {np.percentile(d, 2.5):+.4f}..{np.percentile(d, 97.5):+.4f}), "
             f"relative reduction {1 - score(arm) / score(arm_data[0]):.3f} (95% {np.percentile(rel, 2.5):.3f}..{np.percentile(rel, 97.5):.3f})")
 if outp:
-    Path(outp).write_text("\n".join(lines) + "\n")
+    write_text(outp, "\n".join(lines) + "\n")
 if jsonp:
-    Path(jsonp).write_text(json.dumps(RES, indent=1, default=float))
+    write_text(jsonp, json.dumps(RES, indent=1, default=float))
