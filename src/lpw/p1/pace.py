@@ -119,6 +119,12 @@ class PaceRef(nn.Module):
         assert bool(self.fitted), "PaceRef not fitted"
         idx = torch.nonzero(elig)[:, 0]
         self.stats["eligible"] += len(idx)
+        ok_t = torch.isfinite(t0[idx].double())  # a non-finite origin cannot even build a law: bypass up front
+        if not bool(ok_t.all()):
+            self.stats["invalid"] += int((~ok_t).sum())
+            idx = idx[ok_t]
+            if len(idx) == 0:
+                return lp64
         with torch.no_grad():
             r2 = _rows2(idx)
             t0e = t0[idx].double()

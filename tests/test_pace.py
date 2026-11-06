@@ -220,3 +220,16 @@ def test_grad_and_no_grad_forwards_are_bit_identical():
         a = ref.adapt(lp, lh, ld, t0, logpk, pace)
     b = ref.adapt(lp.double().requires_grad_(True), lh, ld, t0, logpk.requires_grad_(True), pace)
     assert torch.equal(a, b.detach())
+
+
+def test_non_finite_origin_rows_are_bypassed():
+    ref = _ref(seed=3, gamma=0.5)
+    lp, lh, ld, t0, logpk, pace = _inputs(n=12)
+    x, elig = pace
+    bad = int(torch.nonzero(elig)[0, 0])
+    t0 = t0.clone()
+    t0[bad] = float("nan")
+    ref.reset_stats()
+    new = ref.adapt(lp, lh, ld, t0, logpk, pace)
+    rows = torch.tensor([2 * bad, 2 * bad + 1])
+    assert ref.stats["invalid"] == 1 and torch.equal(new[rows], lp.double()[rows])

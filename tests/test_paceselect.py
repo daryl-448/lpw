@@ -117,6 +117,45 @@ def test_failing_gate_rejects_even_when_another_input_is_missing(tmp_path):
     assert gate(r, "g0.75", "O2 mechanism") == "MISSING" and "-> rejected" in r.stdout and "selected: g0.50" in r.stdout
 
 
+def test_failing_gate_rejects_when_the_arms_endpoint_record_is_partial(tmp_path):
+    build(tmp_path)
+    def f(d):
+        d["vs_control"]["g0.75"].update(rel_reduction=0.1)
+        d["arms"]["g0.75"].pop("endpoint_reps")
+    edit(tmp_path / "pacescore_pace_oracle.json", f)
+    r = run(tmp_path)
+    assert gate(r, "g0.75", "O1 pace score") == "FAIL" and gate(r, "g0.75", "O4 endpoint") == "MISSING"
+    assert "selected: g0.50" in r.stdout
+
+
+def test_boolean_values_do_not_pass_numeric_gates(tmp_path):
+    build(tmp_path)
+    edit(tmp_path / "lpw_pace_g0.75" / "pace.json", lambda d: [d["known_plan_nll"][k].update(full=True) for k in d["known_plan_nll"]])
+    edit(tmp_path / "lpw_pace_g0.75" / "pace.json", lambda d: d["unknown_check"].update(prefixes=True))
+    r = run(tmp_path)
+    assert gate(r, "g0.75", "L1 s-unknown identity") == "FAIL" and gate(r, "g0.75", "L2 known-plan NLL") == "FAIL"
+
+
+def test_empty_or_unreadable_files_are_pending(tmp_path):
+    import os
+    build(tmp_path)
+    edit(tmp_path / "pacescore_pace_prior.json", lambda d: d.update(arms={}))
+    r = run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert gate(r, "g0.75", "P2 gain retention") == "MISSING" and "selection pending: g0.75" in r.stdout
+    root2 = tmp_path / "b"
+    root2.mkdir()
+    build(root2)
+    p = root2 / "drift_pace_g0.75_prior.json"
+    os.chmod(p, 0)
+    try:
+        r = run(root2)
+    finally:
+        os.chmod(p, 0o644)
+    assert r.returncode == 0, r.stderr
+    assert gate(r, "g0.75", "P1 survival") == "MISSING" and "selection pending: g0.75" in r.stdout
+
+
 def test_partial_inputs_are_pending_not_crashes(tmp_path):
     build(tmp_path)
     p = tmp_path / "drift_pace_g0.75_prior.json"

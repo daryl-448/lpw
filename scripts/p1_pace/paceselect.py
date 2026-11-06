@@ -73,13 +73,19 @@ def J(p):
             raise Missing(str(p))
         try:
             _cache[p] = Doc(json.loads(p.read_text()), p.name)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise Missing(f"{p} (unreadable / partially written)") from None
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise Missing(f"{p} (unreadable / partially written: {type(e).__name__})") from None
     return _cache[p]
 
 
 def fin(*xs):
+    """every value a real (non-bool) finite number"""
     return all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in xs)
+
+
+def count(x):
+    """x if it is a non-bool int, else None"""
+    return x if isinstance(x, int) and not isinstance(x, bool) else None
 
 
 def pace_json(g):
@@ -92,35 +98,35 @@ def drift(g, mode):
     d = J(root / f"drift_pace_{g}_{mode}.json")
     assert Path(d["ckpt"]).name == f"lpw_pace_{g}" and d["mode"] == mode and d["model"] == "lpw_plan_prog_pace", (g, mode, d["ckpt"])
     assert d["save"] and Path(d["save"]).name == f"gen_pace_{g}_{mode}.parquet", (g, mode, d["save"])
-    assert d["replicas"] == REPS, (g, mode, d["replicas"])
+    assert count(d["replicas"]) == REPS, (g, mode, d["replicas"])
     return d
 
 
 def score_file(mode):
+    """file-level checks only; per-arm checks are in scored() and g_endpoint(), so one arm's partial record never
+    blocks another gate."""
     ps = J(root / f"pacescore_pace_{mode}.json")
     labs = list(ps["arms"])
+    if not labs:
+        raise Missing(f"pacescore_pace_{mode}.json: no arms")
     assert ps["mode"] == mode and ps["control"] == CTRL and labs[0] == CTRL, f"{mode} pacescore: control must be {CTRL}"
     assert set(ps["arm_paths"]) == set(labs) and set(ps["replicas"]) == set(labs), f"{mode} pacescore: incomplete label maps"
-    for lab in labs:
-        assert Path(ps["arm_paths"][lab]).name == f"gen_pace_{lab}_{mode}.parquet", (mode, lab, ps["arm_paths"][lab])
-        assert ps["replicas"][lab] == REPS, (mode, lab, ps["replicas"][lab])
-        for rn in ROLES:
-            for dd in EP_DAYS:
-                assert len(ps["arms"][lab]["endpoint_reps"][rn][dd]) == REPS, (mode, lab, rn, dd)
-    for lab in ps["vs_control"]:
-        assert ps["vs_control"][lab]["control"] == CTRL, (mode, lab)
     return ps
 
 
 def scored(g, mode):
-    """the score file with g and the control present, both matching their drift_exp --save paths."""
+    """the score file with g and the control present, each with five replicas and its own generation (matching its
+    drift_exp --save path), and g's comparison against the control."""
     ps = score_file(mode)
     for lab in (CTRL, g):
         if lab not in ps["arms"]:
             raise Missing(f"{lab} in pacescore_pace_{mode}.json")
+        assert Path(ps["arm_paths"][lab]).name == f"gen_pace_{lab}_{mode}.parquet", (mode, lab, ps["arm_paths"][lab])
+        assert count(ps["replicas"][lab]) == REPS, (mode, lab, ps["replicas"][lab])
         assert Path(ps["arm_paths"][lab]).resolve() == Path(drift(lab, mode)["save"]).resolve(), (lab, mode)
     if g not in ps["vs_control"]:
         raise Missing(f"vs_control {g} in pacescore_pace_{mode}.json")
+    assert ps["vs_control"][g]["control"] == CTRL, (mode, g)
     return ps
 
 
@@ -129,14 +135,18 @@ def g_L1(g):
     pj, pc = pace_json(g), pace_json(CTRL)
     assert pj["base"] == pc["base"], (pj["base"], pc["base"])
     uc, ucc = pj["unknown_check"], pc["unknown_check"]
-    ok = pj["unknown_bit_identical"] is True and uc["complete"] is True and uc["split"] == "val" and uc["prefixes"] == ucc["prefixes"] > 0
+    n, nc = count(uc["prefixes"]), count(ucc["prefixes"])
+    ok = pj["unknown_bit_identical"] is True and uc["complete"] is True and uc["split"] == "val" and n is not None and n == nc and n > 0
     return ok, f"s-unknown val terms bit-identical to the base on {uc['prefixes']} prefixes ({uc['batches']} batches)"
 
 
 def g_L2(g):
     pj, pc = pace_json(g), pace_json(CTRL)
-    dl = {r: pj["known_plan_nll"][r]["full"] - pc["known_plan_nll"][r]["full"] for r in ("all", "normal", "scam")}
-    return all(fin(v) and v <= 0.02 for v in dl.values()), ", ".join(f"{r} {v:+.4f}" for r, v in dl.items()) + " (<= 0.02)"
+    pairs = {r: (pj["known_plan_nll"][r]["full"], pc["known_plan_nll"][r]["full"]) for r in ("all", "normal", "scam")}
+    if not all(fin(a, b) for a, b in pairs.values()):
+        return False, f"non-finite input {pairs}"
+    dl = {r: a - b for r, (a, b) in pairs.items()}
+    return all(v <= 0.02 for v in dl.values()), ", ".join(f"{r} {v:+.4f}" for r, v in dl.items()) + " (<= 0.02)"
 
 
 def g_O1(g):
@@ -175,6 +185,7 @@ def g_endpoint(g, mode):
             real = ps["real_endpoint"][rn][dd]
             A, C = ps["arms"][g]["endpoint"][rn][dd], ps["arms"][CTRL]["endpoint"][rn][dd]
             ra, rc = list(ps["arms"][g]["endpoint_reps"][rn][dd]), list(ps["arms"][CTRL]["endpoint_reps"][rn][dd])
+            assert len(ra) == REPS and len(rc) == REPS, (mode, g, rn, dd, len(ra), len(rc))
             if not fin(A, C, real["share"], real["sd_boot"], *ra, *rc):
                 bad.append(f"{rn} last {dd} d: non-finite input")
                 continue
@@ -205,10 +216,13 @@ def g_P1(g):
 
 
 def g_P2(g):
-    need = 2 / 3 * scored(g, "oracle")["vs_control"][g]["rel_reduction"]
+    o_rr = scored(g, "oracle")["vs_control"][g]["rel_reduction"]
     sc = scored(g, "prior")["vs_control"][g]
     rr, lo = sc["rel_reduction"], sc["improvement_lo"]
-    return fin(need, rr, lo) and rr >= need and lo > 0, f"rel reduction {rr:.3f} (>= {need:.3f}), improvement 95% lo {lo:+.4f} (> 0)"
+    if not fin(o_rr, rr, lo):
+        return False, "non-finite input"
+    need = 2 / 3 * o_rr
+    return rr >= need and lo > 0, f"rel reduction {rr:.3f} (>= {need:.3f}), improvement 95% lo {lo:+.4f} (> 0)"
 
 
 STAGES = [
