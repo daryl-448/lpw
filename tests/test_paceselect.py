@@ -154,6 +154,17 @@ def test_empty_or_unreadable_files_are_pending(tmp_path):
         os.chmod(p, 0o644)
     assert r.returncode == 0, r.stderr
     assert gate(r, "g0.75", "P1 survival") == "MISSING" and "selection pending: g0.75" in r.stdout
+    root3 = tmp_path / "c"
+    root3.mkdir()
+    build(root3)
+    d = root3 / "lpw_pace_g0.75"
+    os.chmod(d, 0)  # unsearchable arm directory
+    try:
+        r = run(root3)
+    finally:
+        os.chmod(d, 0o755)
+    assert r.returncode == 0, r.stderr
+    assert gate(r, "g0.75", "L1 s-unknown identity") == "MISSING" and "selection pending: g0.75" in r.stdout
 
 
 def test_partial_inputs_are_pending_not_crashes(tmp_path):

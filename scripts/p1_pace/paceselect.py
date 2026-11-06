@@ -69,10 +69,10 @@ _cache = {}
 
 def J(p):
     if p not in _cache:
-        if not p.exists():
-            raise Missing(str(p))
-        try:
+        try:  # every filesystem access inside: a missing, unsearchable or unreadable path is MISSING
             _cache[p] = Doc(json.loads(p.read_text()), p.name)
+        except FileNotFoundError:
+            raise Missing(str(p)) from None
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             raise Missing(f"{p} (unreadable / partially written: {type(e).__name__})") from None
     return _cache[p]
