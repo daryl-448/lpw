@@ -131,23 +131,34 @@ def _ts(col: pl.Expr) -> pl.Expr:
     return col.dt.epoch("s")
 
 
-def build_store(pilot: Path, cutoff: int | None = None, raw: Path = Path("data/raw")) -> Store:
+def build_store(pilot: Path, cutoff: int | None = None, raw: Path = Path("data/raw"), splits: tuple[str, ...] | None = None) -> Store:
     """Build the store. With `cutoff`, events at or after it are dropped and observation ends there (temporal check).
-    Labelled contracts (from `raw`) are not sender-capable: contracts never send native ETH in E1 (SPEC §5.1, §6.3)."""
+    Labelled contracts (from `raw`) are not sender-capable: contracts never send native ETH in E1 (SPEC §5.1, §6.3).
+
+    With `splits`, only those splits' agent rows are kept: the scans filter agents by split and events / profiles by
+    the kept node ids before anything is collected, so no other split's row reaches a frame. Every per-agent array is
+    then identical to the full build (all fitted quantities, the profile normaliser and the plan bins, are train-only),
+    but agent indices are positions within the kept agents. Requires 'train' in splits."""
     meta = json.loads((pilot / "meta.json").read_text())
     w_start = int(datetime.fromisoformat(meta["W_START"]).timestamp())
     w_end = int(datetime.fromisoformat(meta["W_END"]).timestamp())
-    ag = pl.read_parquet(pilot / "agents.parquet").sort("node_id")
-    prof = pl.read_parquet(pilot / "profiles.parquet")
+    ag = pl.scan_parquet(pilot / "agents.parquet")
+    if splits is not None:
+        assert "train" in splits, "train-fitted quantities need the train split"
+        ag = ag.filter(pl.col("split").is_in(list(splits)))
+    ag = ag.collect().sort("node_id")
+    keep = ag["node_id"].implode()
+    prof = pl.scan_parquet(pilot / "profiles.parquet").filter(pl.col("node_id").is_in(keep)).collect()
     ven = pl.read_parquet(pilot / "venues.parquet").sort("cp")
-    ev = pl.read_parquet(pilot / "events.parquet")
+    ev = pl.scan_parquet(pilot / "events.parquet").filter(pl.col("node_id").is_in(keep)).collect()
     ag = ag.join(prof.select(["node_id", *PROFILE_FIELDS]), on="node_id", how="left")
 
     venue_ids = ven["cp"].to_numpy()
     venue_sc = ven["sender_capable"].to_numpy().astype(bool)
     vidx = {int(c): i for i, c in enumerate(venue_ids)}
-    contracts = set(pl.read_parquet(raw / "gnn_dataset/labels/targets_global.parquet", columns=["node_id", "is_contract"])
-                    .filter(pl.col("is_contract") == 1)["node_id"].to_list())
+    contracts = set(pl.scan_parquet(raw / "gnn_dataset/labels/targets_global.parquet").select("node_id", "is_contract")
+                    .filter((pl.col("is_contract") == 1) & pl.col("node_id").is_in(ev["cp"].unique().implode()))
+                    .collect()["node_id"].to_list())  # only membership of observed counterparties is ever queried
 
     origin = np.where(ag["cohort"].to_numpy() == "born", ag.select(_ts(pl.col("activity_start_ts"))).to_series().to_numpy(), w_start)
     obs_end = ag.select(_ts(pl.col("obs_end"))).to_series().to_numpy().astype(np.int64)
