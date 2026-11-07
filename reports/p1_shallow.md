@@ -83,3 +83,42 @@ Local GTX 1650S, measured in smoke runs:
 - the readout takes ~10 min.
 
 Expected about 1 h.
+
+## Result (2026-11-07, full run at cc94f18; outputs in `runs/p1_shallow/2018/`)
+
+**Outcome: PROMOTE (primary kct).** Every pre-registered check passes. This is development exploration on val, not
+confirmation.
+
+- **Selection.** kct is the best variant, with lam 10 for all three. It beats zero by 0.022 nats per agent
+  (SE 0.002); k and kc are 0.005-0.006 behind kct.
+- **Teacher-forced, val, kct.**
+  - Shallow NLL vs B: light normal -0.032 per agent, light scam -0.126; mid / heavy -0.01 to -0.03.
+  - Known-plan NLL per owned event: -0.006 normal, -0.007 scam (kill threshold +0.02).
+  - Light normal P(OUT) at depth 1: 0.627 vs 0.629 observed (B 0.517).
+  - Incoming REPEAT at depth 1: 0.452 vs 0.425 (B 0.529).
+  - New miss: incoming REPEAT at depth 2 is now 0.431 vs 0.551 observed (B 0.472).
+  - s-unknown val NLL identical for every arm (13.127763760493428).
+- **Generation.** M-pass, 5 paired replicas; replica sd 0.05-0.07 oracle, ~0.1 prior.
+
+  | | B | k | kc | kct | matched real |
+  |---|---|---|---|---|---|
+  | oracle normal | 0.650 | 0.775 | 0.787 | **0.825** | 0.963 |
+  | oracle normal light 1-4 | 0.425 | 0.662 | 0.800 | **0.863** | 0.963 |
+  | oracle normal mid 5-99 | 0.738 | 0.575 | 0.625 | **0.738** | 0.879 |
+  | oracle normal heavy 100+ | 0.875 | 0.825 | 0.775 | 0.850 | 0.979 |
+  | oracle scam | 0.863 | 0.838 | 0.938 | 0.925 | 0.979 |
+  | prior normal | 0.637 | 0.662 | 0.725 | **0.725** | - |
+  | prior scam | 0.825 | 0.850 | 0.838 | 0.825 | - |
+
+  - Gap closed (kct, oracle): light normal 81%, normal overall 56%.
+  - Mid normal ties B exactly: the rule passes on equality only. k and kc worsen mid, so the time tilts are what keep
+    it level.
+  - Prior normal +0.088 vs B: 50% retention of the oracle gain, within about one replica sd.
+  - Safety counts are no worse than B's.
+- **Reference.** The matched-real reference (0.963) is higher than the brainstorm's profile-only ceiling (~0.84). It
+  matches on the plan count bucket and is scored on the arms' split seeds, with 7 fallback donors per draw.
+- **Reading.** The shallow under-fit was a cheap, fixable conditional error, and fixing it carries into rollouts.
+  What remains:
+  - the prior-mode loss (oracle 0.825 -> prior 0.725 normal);
+  - the mid band, flat vs B and 0.14 below its reference;
+  - B1 NLL non-inferiority: open, and untouched by this correction.
