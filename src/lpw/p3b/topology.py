@@ -65,6 +65,22 @@ def daily_metrics(u: np.ndarray, v: np.ndarray) -> dict[str, float]:
             "transitivity": float(nx.transitivity(G))}
 
 
+def clauset_inputs(u, v, eth) -> dict[str, np.ndarray]:
+    """§P8 Clauset inputs of one full view from its transaction table (u sender, v receiver, eth value excl. fees):
+    unique-neighbour degree and transaction-count degree on the simple graph (self-transfers dropped), strength
+    = summed ETH per node (self-transfers kept, counted on both endpoints, as in prefreeze_topology.py), and the
+    per-transaction ETH amounts."""
+    u, v, eth = np.asarray(u), np.asarray(v), np.asarray(eth, np.float64)
+    nodes, inv = np.unique(np.concatenate([u, v]), return_inverse=True)
+    ui, vi = inv[: len(u)], inv[len(u):]
+    m = ui != vi
+    pairs = np.unique(np.stack([np.minimum(ui[m], vi[m]), np.maximum(ui[m], vi[m])], 1), axis=0)
+    return {"unique_degree": np.bincount(pairs.ravel(), minlength=len(nodes)),
+            "tx_degree": np.bincount(np.concatenate([ui[m], vi[m]]), minlength=len(nodes)),
+            "strength": np.bincount(np.concatenate([ui, vi]), weights=np.concatenate([eth, eth]), minlength=len(nodes)),
+            "amount": eth}
+
+
 GRID = np.linspace(0, 0.99, 100)  # continuous xmin candidates: empirical quantiles of the sample being fitted
 MIN_VALID_REFITS = 90                # of 100 attempted bootstrap refits; fewer -> gof_p undefined
 ZETA_TABLE = 100_000                 # exact discrete sampler: survival table length before integer bisection

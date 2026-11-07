@@ -189,3 +189,55 @@ def test_node_key_namespaces():
     allk = np.concatenate(k)
     assert len(np.unique(allk)) == 6
     assert key_kind(k[2]).tolist() == [S_PERIPHERY] * 2
+
+
+# ---------------------------------------------------------------- readout statistics (fabricated data only)
+def test_group_folds_whole_groups_and_balance():
+    from lpw.p3b.evaluate import group_folds
+    rng = np.random.default_rng(1)
+    g = rng.integers(0, 200, 3000)
+    f = group_folds(g)
+    for u in np.unique(g):
+        assert len(np.unique(f[g == u])) == 1
+    load = np.bincount(f, minlength=5)
+    assert load.max() - load.min() <= np.bincount(g).max()
+    assert (group_folds(g) == f).all()
+
+
+def test_c2st_grouped_null_shift_and_not_testable():
+    from lpw.p3b.evaluate import c2st_grouped
+    rng = np.random.default_rng(2)
+    Xa, Xb = rng.normal(size=(600, 3)), rng.normal(size=(600, 3))
+    ga, gb = rng.integers(0, 60, 600), rng.integers(0, 60, 600)
+    assert abs(c2st_grouped(Xa, ga, Xb, gb) - 0.5) < 0.08
+    assert c2st_grouped(Xa, ga, Xb + 2.0, gb) > 0.9
+    assert c2st_grouped(Xa, np.zeros(600, int), Xb, gb) is None  # one real group cannot fill five folds
+
+
+def test_incremental_math_and_rules():
+    from lpw.p3b.evaluate import incremental
+    rng = np.random.default_rng(3)
+    y = (rng.random(2000) < 0.2).astype(int)
+    z = rng.normal(size=2000)
+    sL = z + 1.0 * y
+    sLS = z + 1.6 * y
+    draws = [rng.integers(0, 2000, 2000) for _ in range(960)]
+    out = incremental(y, draws, sL, sLS, [sL, sL], {"p3b0": [sL, sL], "p3b1": [sLS, sLS]})
+    p = out["point"]
+    from sklearn.metrics import roc_auc_score
+    R = roc_auc_score(y, sLS) - roc_auc_score(y, sL)
+    assert abs(p["R"] - R) < 1e-12 and abs(p["T1"] - R) < 1e-12 and abs(p["T0"]) < 1e-12
+    assert abs(p["D"] - 0.2 * R) < 1e-12 and abs(p["H"] - R) < 1e-12
+    assert R >= 0.02 and out["utility"] == "SUPPORTED" and out["learning"] == "SUPPORTED"
+    flat = incremental(y, draws, sL, sL, [sL], {"p3b0": [sL], "p3b1": [sL]})
+    assert flat["utility"] == "NOT TESTABLE" and flat["learning"] == "NOT SUPPORTED"
+    few = incremental(y, draws[:10], sL, sLS, [sL], {"p3b0": [sL], "p3b1": [sLS]})
+    assert few["utility"].startswith("NOT TESTABLE")
+
+
+def test_clauset_inputs_self_transfer():
+    from lpw.p3b.topology import clauset_inputs
+    x = clauset_inputs(np.array([1, 1, 2, 3]), np.array([2, 2, 2, 1]), np.array([1.0, 2.0, 5.0, 4.0]))  # nodes 1, 2, 3
+    assert x["unique_degree"].tolist() == [2, 1, 1]
+    assert x["tx_degree"].tolist() == [3, 2, 1]
+    assert x["strength"].tolist() == [7.0, 13.0, 4.0]  # node 2's self-transfer counts on both endpoints
