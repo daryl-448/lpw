@@ -122,3 +122,19 @@ confirmation.
   - the prior-mode loss (oracle 0.825 -> prior 0.725 normal);
   - the mid band, flat vs B and 0.14 below its reference;
   - B1 NLL non-inferiority: open, and untouched by this correction.
+
+### Amendment (2026-11-07, after the prior decomposition): order-dependent floors
+
+`compare()` draws every group's bootstrap floors from one rng, in group order (`reports/p1_prior.md`). Only the
+first group, `normal`, is scored on canonical floors in this readout.
+
+Sol rescored the saved oracle streams with each group scored alone (seed = replica):
+- normal mid 5-99: B 0.750, kct 0.688, matched real 0.875;
+- the readout above has B 0.738, kct 0.738.
+
+Under singleton floors, the pre-registered "mid normal M-pass not below B" rule fails, by 0.06. That is within the
+replica sd of about 0.07, so it is not proof of a mid-band regression. But the PROMOTE outcome depends on the floor
+draw and does not carry forward unqualified.
+
+The light and overall-normal results are not affected in direction: light 0.850 in the singleton rescoring
+(`runs/p1_prior/2018/decompose.txt`), normal unchanged.
