@@ -256,3 +256,83 @@ alternative O variants.
 
 **After the readout (`reports/p3a_readout.md`):** no protocol change. The Checkpoint 0 diagnosis (world 0) and one
 exploratory C2ST probe (with and without BAL) are labelled as such. Their scripts are in `reports/p3a/`.
+
+## 15. Addendum A (2026-11-07, before fitting): the defect-1 sweep repair
+
+Written after `reports/p3a_readout.md` fired the §10 trigger (kct balance sentinels flagged). The user approved
+(D4, then "yes go"). The design is Sol's consult (`sol_consult_sweep/consult.md`, scratch). This addendum replaces
+§10's informal wording where the two differ.
+
+**Status.** This is development evaluation informed by the first val readout, not fresh confirmation. It does not
+change any P1 qualification claim, and success would not qualify P3 overall.
+
+### A.1 Mechanism (kct only; one candidate)
+
+- **What is added.** One frozen-backbone Bernoulli **sweep gate** on OUT events. Everything else stays frozen: the
+  kct base, the kct offsets, the plan prior, the population models and FeePool.
+- **Branch.** On a sweep, amount = b - fee, persisted in float64 as `eth`, with `amt = log10(eth)`. Otherwise the
+  unchanged truncated-MoG draw is used, with no affordability clipping.
+- **Order and randomness:**
+  - the fee is the existing FeePool draw, reused for eligibility, amount and ledger;
+  - the MoG draw is still consumed for every event;
+  - the branch uses a separate NumPy RNG with seed 3000 + world;
+  - with the gate disabled, generation is bit-identical to the current code (a unit test checks this).
+- **Eligibility:** an OUT, with b and fee finite, fee ≥ 0, and 1e-4 ≤ b - fee ≤ SUPPLY. Ineligible rows never
+  sweep and are counted.
+- **A sweep does not end a stream.** Later IN, OUT and repeat sweeps are allowed.
+
+### A.2 Labels and fit (real train only)
+
+- **Label.** On eligible train OUTs: y = 1 iff |b - eth - fee| ≤ 1e-4, where b is the pre-event ledger (`store.bal`
+  = b0 + all observed incident flows; an exact replay was verified). All other eligible OUTs, including
+  proxy-negative ones, have y = 0.
+- **Features** (fixed; no search):
+  - the frozen amount-head input `amt_x` of the target OUT (kct, plan inference on, real train plan,
+    generation-matched exact windows);
+  - one-hot role, cohort, count-plan bucket, amount-plan bucket, and `progress_state(plan_n, n_own + 1)`;
+  - the scalars log1p(n_own), log10((b - fee) / 1e-4), fee / b, and log1p((w_end - t) / 86400).
+- **Standardization.** Continuous coordinates (amt_x and the scalars) use train statistics. One-hot coordinates are
+  left as they are.
+- **Fit.** Logistic regression minimizing summed BCE + 10/2 · ||β||², with the intercept unpenalized.
+  Deterministic L-BFGS from zero, max_iter 500.
+- **Diagnostics only.** Three whole-train-group folds (seed 0) give OOF BCE and calibration by role. They select
+  nothing. The final gate is refitted on all train once.
+- **Banned:** class weighting, a threshold, calibration to rollouts, val stopping, any change of ε or the label
+  band.
+- **Reported:** the gate BCE, separately. The frozen P1 NLL / B1 results stand as published, labelled as the frozen
+  backbone's. No repaired full-event NLL is claimed.
+
+### A.3 Worlds and seeds
+
+- **Worlds** w ∈ {10, 11, 12}: populations as in §2 (seeds 1010-1012 and 2010-2012), generation seed 100 + w, sweep
+  seed 3000 + w.
+- **Arms:** `kct_sweep` (candidate) and unmodified `kct` (the control on the same populations). There is no
+  repaired B. The original worlds 0-2 and their readout stay archived.
+
+### A.4 Acceptance (decided and written to `runs/p3a/2018/sweep/acceptance.json` before any utility or C2ST number)
+
+| gate | rule |
+|---|---|
+| Mechanism | For each role, the share of retained holdout agents ending at \|b0 + Σ flows\| ≤ 1e-4, averaged over the three worlds, lies in [0.5 R_r, 1.5 R_r]. R_r is frozen from real train (all-incident O): **R_normal = 0.13345, R_scam = 0.40725**, so the bands are [0.0667, 0.2002] and [0.2036, 0.6109]. |
+| Fidelity | For each role, mean over worlds of (M-pass kct_sweep - M-pass kct) ≥ -0.10, on the same holdout population. Unchanged scorer, unpaired vs real val, seed 0, 20 half-splits. |
+| Safety | Every population of both arms individually passes §9. |
+
+- Boundaries count as a pass. A missing or undefined quantity fails.
+- No world is stopped early except for safety or budget.
+
+### A.5 Readout and failure
+
+- **Readout.** The §5-§8 readout runs once on worlds 10-12 for both arms (`--tag _sweep`), whatever the decision,
+  and a rejected result is labelled REJECTED. It also reports the fixed attribution diagnostics:
+  - per-role BAL-only C2ST and LOCAL + VENUE C2ST without BAL;
+  - per-role single-feature seam AUC for every local feature;
+  - per-role sweep-event share, the share of agents ever sweeping, the terminal near-zero share, the negative-OUT
+    share, the share of sweeps that are the last OUT, and the share of sweeping agents with a later IN.
+
+  None of these is a tuning target.
+- **Budget:** one build day and ≤ 2 GPU-hours in all.
+- **Stops and failures:**
+  - a safety failure stops the experiment, with no readout;
+  - a budget or technical failure is reported as inconclusive;
+  - nothing is retuned: no seed replacement, no wider band, no second head, no backbone change, no utility-based
+    rescue. A demonstrable bug fix is allowed within budget, disclosed, and rerun with the same seeds.
