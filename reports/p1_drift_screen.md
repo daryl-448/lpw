@@ -1,7 +1,10 @@
 # P1 drift screen v2 (partial-backbone, shift consistency): pre-registration
 
-Written before any R snapshot was evaluated (2026-11-07). Design: Sol drift-screen-v2 round (after the base
-qualification), amended by Sol build review r1. Code: `src/lpw/p1/drift_ft.py`, `scripts/p1_drift/screen.py`.
+Written before any full-size R snapshot was evaluated (2026-11-07). Reduced plumbing smoke runs (snapshots 0 / 25, a
+360-agent val subset, 2 replicas, small bootstraps) did evaluate an R step-25 snapshot; they checked the code only,
+and their gate outcomes did not inform the recipe or the thresholds (the one design change they caused is the
+safety amendment below, driven by B). Design: Sol drift-screen-v2 round (after the base
+qualification), amended by Sol build reviews r1 and r2 (r2 amendments marked below; made before any full-size run). Code: `src/lpw/p1/drift_ft.py`, `scripts/p1_drift/screen.py`.
 
 ## Why
 
@@ -20,6 +23,13 @@ summaries printed with them; `runs/p1_drift_pilot/`). No R outcome selected the 
   C still selects step 0 there (every snapshot has a worse unknown-plan val NLL than B). C = step 0 is a legitimate outcome.
 - The designed J weight 0.05 gave a J gradient 5e-5 to 4e-4 of the clean one at step 0; the weight is now set by the
   calibration rule below.
+
+**Safety amendment (r2; before the full run).** In a reduced smoke run (val subset, 2 replicas; plumbing only), B itself
+produced one capped prior-mode stream: an open-bucket plan (no finite upper count) that reached the 10,000-event cap with a
+longest same-second run of 4. A zero-cap gate would then fail the base, so it cannot separate R from C or B. Following
+Sol r2, the cap gate is relative (policy (b) below) and the absolute gates stay for the failures that are pathological
+for any plan. B's full-val prior-mode safety counts are measured and disclosed before R is fitted; the policy will not be
+changed again on the basis of B's (or any arm's) counts.
 
 ## Arms (2018, base `runs/p1_r0/2018/lpw_plan_prog_rp`, one seed 20261104)
 
@@ -58,7 +68,7 @@ Both arms (identical except J):
 - **Weight.** At step 0, w_J = 0.25 x median ||g_clean|| / median ||g_J||. This uses 16 fixed (clean batch,
   auxiliary batch) pairs (seed 777), the scaled clean objective, the trainable parameters and the training precision,
   with the RNG state restored. The calibration aborts on fewer than 16 pairs, non-finite losses or gradients, or a
-  non-positive median or weight. No weight sweep or outcome-dependent adjustment.
+  non-positive median or weight; the 16 scaled clean losses are recorded and must be finite too. No weight sweep or outcome-dependent adjustment.
 
 ## Likelihood budget and selection (`screen.py eval` / `select`)
 
@@ -73,10 +83,15 @@ Both arms (identical except J):
   - e_tt is the change in the forecast E log10 positive gap per unit dt shift (+-0.3).
   - e_aa is the change in the forecast truncated log10-amount mean per unit amount shift (+-0.5).
 - Step 0 is included. Ties go to the earlier snapshot. A non-finite score aborts.
+- Every shift item's next event exists and is owned, so every e_* forecast must be finite: a non-finite value aborts
+  the evaluation (r2: no item is dropped).
 - No threshold relaxation, runner-up substitution or unregistered refitting after a failure.
 
 **Integrity.**
 - Every evaluation and generation artifact is fingerprinted by its checkpoint's sha256 and checked on use.
+- (r2) Each is also bound to its population and recipe version: evaluations store a hash of the val, retention and
+  shift-item populations and must contain every prefix of each population once; generations store a hash of the val and
+  pilot populations. A mismatch aborts.
 - The selected checkpoints are re-checked.
 - The C / R recipes must be equal apart from J.
 - Step 0 of each arm must be state-identical to B.
@@ -102,7 +117,9 @@ Both arms (identical except J):
   prefix. The generated forecast is averaged over the replicas that reach the depth.
 - Statistic: mean |discrepancy| over the pairs with a value in all of B, C and R (common support).
 - Gate: >= 25% reduction vs C, bootstrap lower bound > 0 (seed 3), and R <= B on the common support.
-- Coverage guard: at every depth, R's share of real pairs with at least one reaching replica is >= max(C, B) - 0.05.
+- Coverage guard: at every depth, R's share of real pairs with at least one reaching replica is >= max(C, B) - 0.05
+  (an engineering margin, not a statistical bound).
+- Real and generated forecasts must be finite (r2); a non-finite value aborts.
 - D is conditional on reaching the prefix. Coverage and reach-100 are reported alongside it.
 
 **G. Pilot generation.**
@@ -112,11 +129,14 @@ Both arms (identical except J):
 - Each must satisfy R <= B.
 - reach-100: R >= C and R >= B.
 
-**P. Safety (prior mode, all 3 replicas).**
-- Zero capped streams.
-- Zero finite-plan streams with N > 3U, where U is the plan bucket's upper count; zero-plan streams must be empty.
-- Zero same-second runs longer than 10 x the real-training maximum (133 in 2018; recomputed and recorded).
+**P. Safety (prior mode, all 3 replicas; amended r2, policy (b)).**
+- Capped streams (N reaching 10,000), pooled over the 3 replicas: R <= B and R <= C.
+- Absolute, all replicas:
+  - zero finite-plan streams with N > 3U, where U is the plan bucket's upper count;
+  - zero nonempty zero-plan streams;
+  - zero same-second runs longer than 10 x the real-training maximum (133 in 2018; recomputed and recorded).
 - Reported, not gated:
+  - capped counts per replica, split into finite-plan and open-bucket plans;
   - the longest run per replica;
   - runs above the real maximum;
   - N > U;
@@ -145,8 +165,8 @@ Both arms (identical except J):
 ## Compute
 
 Local GTX 1650S, measured on the pilot:
-- about 2 min per checkpoint evaluation (15 evaluations);
+- about 2 min per checkpoint evaluation (15 evaluations: B plus 7 snapshots per arm);
 - 4 min (C) and about 12 min (R) of fine-tuning;
 - generation and fidelity not yet timed at full size.
 
-Expected 2-3 h locally; the user is asked before a run that exceeds 4 h.
+Expected 2-3 h locally (no rented GPU); the user is asked before a run that exceeds 4 h.

@@ -190,7 +190,7 @@ def calibrate_wj(model, teacher, views, agents, ref_rows, dev, kappa=KAPPA, n=CA
     rng = np.random.default_rng(seed)
     tb = pack(train_specs(views.store, agents, rng), views, rng=rng)[:n]
     aux = AuxDS(views, agents, n, seed=seed)
-    gc, gj, jv = [], [], []
+    gc, gj, jv, lc = [], [], [], []
     was = (model.training, model.plan_inference)
     devs = [torch.device(dev).index or 0] if torch.device(dev).type == "cuda" else []
     with torch.random.fork_rng(devices=devs):
@@ -199,7 +199,9 @@ def calibrate_wj(model, teacher, views, agents, ref_rows, dev, kappa=KAPPA, n=CA
             model.train()
             model.plan_inference = False
             loss, _ = model.loss(b)
-            gc.append(gnorm(loss * (len(b["row_b"]) / ref_rows)))
+            sl = loss * (len(b["row_b"]) / ref_rows)
+            lc.append(sl.item())
+            gc.append(gnorm(sl))
             c, r = aux[i]
             model.eval()
             model.plan_inference = True
@@ -207,12 +209,13 @@ def calibrate_wj(model, teacher, views, agents, ref_rows, dev, kappa=KAPPA, n=CA
             gj.append(gnorm(J.float()))
             jv.append(J.item())
     _restore(model, was)
-    ok = len(gc) == n and len(gj) == n and np.isfinite(gc).all() and np.isfinite(gj).all() and np.isfinite(jv).all()
+    ok = (len(gc) == n and len(gj) == n and len(lc) == n and len(jv) == n and np.isfinite(lc).all() and np.isfinite(gc).all()
+          and np.isfinite(gj).all() and np.isfinite(jv).all())
     mc, mj = float(np.median(gc)), float(np.median(gj))
     w = kappa * mc / mj if ok and mj > 0 else float("nan")
     if not (ok and mc > 0 and mj > 0 and np.isfinite(w) and w > 0):
         raise RuntimeError(f"w_J calibration invalid (pairs {len(gc)}/{len(gj)} of {n}, medians {mc}, {mj}); aborting")
-    return {"w_j": w, "kappa": kappa, "n": n, "seed": seed, "grad_clean": gc, "grad_J": gj, "J": jv}
+    return {"w_j": w, "kappa": kappa, "n": n, "seed": seed, "clean_loss_scaled": lc, "grad_clean": gc, "grad_J": gj, "J": jv}
 
 
 def finetune(pilot: Path, base: Path, out: Path, arm: str, steps=SNAPS[-1], kappa=KAPPA, seed=20261104, dev="cuda", log=print, lr_enc=LR_ENC, lr_head=LR_HEAD, holdout=HOLDOUT,

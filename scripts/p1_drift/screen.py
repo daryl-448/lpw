@@ -44,7 +44,18 @@ SHIFTS = {"dt+": (0.3, 0.0), "dt-": (-0.3, 0.0), "da+": (0.0, 0.5), "da-": (0.0,
 PLAN300 = int(np.searchsorted(COUNT_EDGES, 300))  # count bucket index of >= 300 owned events
 EV = ("kind", "ts", "cls", "ent", "venue", "amt", "eth", "fee", "bal")
 GEN_RECIPE = {"pilot_reps": PILOT_REPS, "prior_reps": PRIOR_REPS, "pilot_cap": PILOT_CAP, "prior_cap": PRIOR_CAP, "gen_seed": GEN_SEED,
-              "plan_seed": PLAN_SEED, "population": "val"}
+              "plan_seed": PLAN_SEED, "population": "val", "version": 2}
+EVAL_VERSION = 2
+
+
+def arr_sha(*arrays) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for a in arrays:
+        a = np.ascontiguousarray(a)
+        h.update(str((a.dtype.str, a.shape)).encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
 X = None  # bin log-midpoints on the GPU (forecast)
 
 
@@ -59,6 +70,15 @@ class Ctx:
         self.gid = np.array([gid_of[int(x)] for x in st.node_id])  # per store agent
         from lpw.p1.anchor import split_groups
         self.ret = split_groups(st, self.pilot, RETENTION)[1]  # reported-only retention subset (in B's and C/R's training data)
+
+    def eval_pop_sha(self):
+        if not hasattr(self, "_eval_pop"):
+            it = shift_items(self)
+            self._eval_pop = arr_sha(self.va, self.ret, np.array(it, np.int64).reshape(-1, 3))
+        return self._eval_pop
+
+    def gen_pop_sha(self):
+        return arr_sha(self.va, pilot_agents(self))
 
     def ckpt(self, arm, step):
         return self.base if arm == "B" or step == 0 else self.root / arm / f"step{step:04d}"
@@ -174,6 +194,10 @@ def cmd_eval(ctx, arm, step):
     out["e_aa"] = (F["da+"][1] - F["da-"][1]) / 1.0
     out["item_agent"] = np.array([a for a, _, _ in items], np.int64)
     out["item_depth"] = np.array([d for _, d, _ in items], np.int64)
+    for k in ("e_tt", "e_at", "e_ta", "e_aa"):  # every item's next event exists and is owned: all forecasts must be finite
+        assert np.isfinite(out[k]).all(), f"non-finite {k} forecast at {arm} step {step}"
+    out["pop_sha"] = np.array(ctx.eval_pop_sha())
+    out["version"] = np.array(EVAL_VERSION)
     (ctx.root / "eval").mkdir(parents=True, exist_ok=True)
     with atomic_path(ctx.root / "eval" / f"{arm}_{step:04d}.npz") as t, open(t, "wb") as f:
         np.savez(f, **out)
@@ -184,6 +208,11 @@ def cmd_eval(ctx, arm, step):
 def load_eval(ctx, arm, step):
     E = dict(np.load(ctx.root / "eval" / f"{'B' if step == 0 else arm}_{step:04d}.npz"))
     assert str(E["sha"]) == file_sha(ctx.ckpt(arm, step) / "model.pt"), f"eval of {arm} step {step} is not of the current checkpoint"
+    assert int(E["version"]) == EVAL_VERSION and str(E["pop_sha"]) == ctx.eval_pop_sha(), f"eval of {arm} step {step}: other population / recipe"
+    for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):  # every prefix of the registered population, once
+        n_exp = sum(ctx.st.n_events(int(a)) + 1 for a in agents if ctx.st.origin[a] < ctx.st.obs_end[a])
+        assert len(E[f"who_{sname}"]) == n_exp and np.array_equal(np.unique(E[f"who_{sname}"]),
+                                                                   np.unique([a for a in agents if ctx.st.origin[a] < ctx.st.obs_end[a]]))
     return E
 
 
@@ -230,7 +259,8 @@ RECIPE_KEYS_DIFFER = ("arm", "w_j", "calibration", "trace", "sec", "snap_sha", "
 
 
 def mean_abs_normal(ctx, E, k):
-    nm = (ctx.st.role[E["item_agent"]] == 0) & np.isfinite(E[k])
+    nm = ctx.st.role[E["item_agent"]] == 0
+    assert np.isfinite(E[k][nm]).all(), f"non-finite {k} forecast"
     return float(np.abs(E[k][nm]).mean())
 
 
@@ -289,7 +319,7 @@ def selected(ctx):
 def check_gen(ctx, arm, step):
     g = json.loads((ctx.root / "gen" / f"{arm}_gen.json").read_text())
     assert g["step"] == step and g["sha"] == file_sha(ctx.ckpt(arm, step) / "model.pt"), f"{arm}: generation is not of the selected checkpoint"
-    assert g["recipe"] == GEN_RECIPE, f"{arm}: generation recipe differs"
+    assert g["recipe"] == GEN_RECIPE and g["pop_sha"] == ctx.gen_pop_sha(), f"{arm}: generation recipe / population differs"
 
 
 # ---- generation ------------------------------------------------------------------------------------------------------
@@ -312,7 +342,7 @@ def prior_plans(ctx):
 
 def cmd_gen(ctx, arm):
     from lpw.p1.run import generate_replicas, write_replicas
-    steps, _ = selected(ctx)
+    steps = {"B": 0} if arm == "B" else selected(ctx)[0]  # B needs no selection (measured before the R run)
     m = ctx.model(arm, steps[arm])
     st = ctx.st
     gd = ctx.root / "gen"
@@ -329,7 +359,7 @@ def cmd_gen(ctx, arm):
     with atomic_path(gd / f"{arm}_prior.plans.npz") as t, open(t, "wb") as f:
         np.savez(f, plan_n=np.stack([p[0] for p in plans]), plan_a=np.stack([p[1] for p in plans]))
     write_text(gd / f"{arm}_gen.json", json.dumps({"step": steps[arm], "sha": file_sha(ctx.ckpt(arm, steps[arm]) / "model.pt"), "recipe": GEN_RECIPE,
-                                                  "pilot_capped": gi["capped"], "prior_capped": info["capped"]}, indent=1))
+                                                  "pop_sha": ctx.gen_pop_sha(), "pilot_capped": gi["capped"], "prior_capped": info["capped"]}, indent=1))
     print(f"gen {arm} (step {steps[arm]}): pilot capped {gi['capped']}, prior capped {info['capped']}")
 
 
@@ -479,6 +509,7 @@ def cmd_report(ctx):
         # (D): forecasts on the arm's own generated prefixes vs on the real prefix at the same owned-event depth
         m = ctx.model(arm, steps[arm])
         fr = forecast(ctx, m, [ctx.views(int(sa[j])) for j, _, _ in real_items], [k for _, _, k in real_items])
+        assert np.isfinite(fr[0]).all() and np.isfinite(fr[1]).all(), f"{arm}: non-finite real-prefix forecast"
         sv, sk, sidx = [], [], []
         for p, (j, d, _) in enumerate(real_items):
             for r in range(PILOT_REPS):
@@ -490,6 +521,7 @@ def cmd_report(ctx):
                 if k is not None:
                     sv.append(vv); sk.append(k); sidx.append(p)
         fs = forecast(ctx, m, sv, sk) if sv else (np.zeros(0), np.zeros(0))
+        assert np.isfinite(fs[0]).all() and np.isfinite(fs[1]).all(), f"{arm}: non-finite generated-prefix forecast"  # NaN = not reached only
         sidx = np.array(sidx, np.int64)
         out = {"reached": np.bincount(sidx, minlength=len(real_items))}  # replicas reaching the pair's depth
         for q, key in ((0, "D_t"), (1, "D_a")):
@@ -553,7 +585,7 @@ def cmd_report(ctx):
         assert all(np.array_equal(P[k], plans0[k]) for k in P), "arms used different prior plans"
         ev = pl.read_parquet(ctx.root / "gen" / f"{arm}_prior.parquet")
         EVS[arm] = ev
-        sf = {"capped": [], "over3U": [], "zero_plan_nonempty": [], "runs_over": [], "max_run": [], "over_real_max": [],
+        sf = {"capped": [], "capped_finite_plan": [], "capped_open_plan": [], "over3U": [], "zero_plan_nonempty": [], "runs_over": [], "max_run": [], "over_real_max": [],
               "overU": [], "open_over_real_max_len": []}
         for r in range(PRIOR_REPS):
             streams = split_streams(ev.filter(pl.col("replica") == r).drop("replica"), len(va))
@@ -563,6 +595,8 @@ def cmd_report(ctx):
             U = np.where(fin, COUNT_EDGES[np.minimum(pn + 1, N_PLAN_N - 1)] - 1, np.iinfo(np.int64).max)
             runs = np.array([max_run(s_["ts"]) for s_ in streams])
             sf["capped"].append(int((N >= PRIOR_CAP).sum()))
+            sf["capped_finite_plan"].append(int((fin & (N >= PRIOR_CAP)).sum()))
+            sf["capped_open_plan"].append(int(((~fin) & (N >= PRIOR_CAP)).sum()))
             sf["over3U"].append(int((fin & (N > 3 * U)).sum()))
             sf["zero_plan_nonempty"].append(int(((pn == 0) & (N > 0)).sum()))
             sf["runs_over"].append(int((runs > RUN_X * rmax).sum()))
@@ -571,7 +605,7 @@ def cmd_report(ctx):
             sf["overU"].append(int((fin & (N > U)).sum()))
             sf["open_over_real_max_len"].append(int(((~fin) & (N > nmax)).sum()))
         RES["safety"][arm] = sf
-        say(f"(P) {arm}: capped {sf['capped']}, finite-plan N > 3U {sf['over3U']} (zero-plan nonempty {sf['zero_plan_nonempty']}), "
+        say(f"(P) {arm}: capped {sf['capped']} (finite plan {sf['capped_finite_plan']}, open {sf['capped_open_plan']}), finite-plan N > 3U {sf['over3U']} (zero-plan nonempty {sf['zero_plan_nonempty']}), "
             f"runs > {RUN_X} x {rmax} {sf['runs_over']}; reported: max run {sf['max_run']}, runs > {rmax} {sf['over_real_max']}, "
             f"N > U {sf['overU']}, open-bucket N > {nmax} {sf['open_over_real_max_len']}")
     fgroups = {g: groups[g] for g in FID_GROUPS}
@@ -617,7 +651,8 @@ def cmd_report(ctx):
         g[f"G {k} R <= B"] = pi["R"][k] <= pi["B"][k]
     g["G reach-100 R >= C and >= B"] = pi["R"]["reach100"] >= max(pi["C"]["reach100"], pi["B"]["reach100"])
     sfR = RES["safety"]["R"]
-    g["P R zero capped streams"] = sum(sfR["capped"]) == 0
+    g["P R capped streams (pooled over replicas) <= B and <= C"] = sum(sfR["capped"]) <= min(sum(RES["safety"]["B"]["capped"]), sum(RES["safety"]["C"]["capped"]))
+    g["P R zero nonempty zero-plan streams"] = sum(sfR["zero_plan_nonempty"]) == 0
     g["P R zero finite-plan streams with N > 3U"] = sum(sfR["over3U"]) == 0
     g[f"P R zero same-second runs > {RUN_X} x real-train max"] = sum(sfR["runs_over"]) == 0
     fi = RES["fidelity"]
