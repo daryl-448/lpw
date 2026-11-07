@@ -14,12 +14,15 @@ import numpy as np
 from lpw.p1.atomic import write_text
 from lpw.p1.run import generate_replicas, write_replicas
 from lpw.p1.store import build_store
+from lpw.p1.sweep import Sweeper, load as load_gate
 from lpw.p1.train import load
 from lpw.p3.population import Population
 
 PILOT = Path("data/pilot_2018")
 ARMS = {"B": ("lpw_plan_prog", "runs/p1_r0/2018/lpw_plan_prog_rp"),
-        "kct": ("lpw_plan_prog_shallow_kct", "runs/p1_shallow/2018/kct")}
+        "kct": ("lpw_plan_prog_shallow_kct", "runs/p1_shallow/2018/kct"),
+        "kct_sweep": ("lpw_plan_prog_shallow_kct", "runs/p1_shallow/2018/kct")}  # + the sweep gate (prereg §15)
+SWEEP_SEED = 3000                          # + world
 POP_SEED = {"train": 1000, "hold": 2000}   # + world
 GEN_SEED = 100                             # + world
 
@@ -49,10 +52,11 @@ for arm in a.arms.split(","):
     model = load(PILOT, name, Path(ckpt), st)
     model.plan_inference = True
     t = time.time()
-    reps, gi = generate_replicas(model, [pops["train"], pops["hold"]], st, seed=GEN_SEED + a.world, log=lambda *x: None)
+    sweeper = Sweeper(load_gate(Path(a.root) / "sweep" / "gate.pt"), SWEEP_SEED + a.world, st.w_end) if arm == "kct_sweep" else None
+    reps, gi = generate_replicas(model, [pops["train"], pops["hold"]], st, seed=GEN_SEED + a.world, log=lambda *x: None, sweeper=sweeper)
     for part, (_, ev) in zip(("train", "hold"), reps):
         write_replicas([(None, ev)], out / f"{arm}_{part}.parquet")
-    info["arms"][arm] = {"config": name, "ckpt": ckpt, "sec": round(time.time() - t), "events": [e.height for _, e in reps],
+    info["arms"][arm] = {"config": name, "ckpt": ckpt, "sweep_seed": SWEEP_SEED + a.world if sweeper else None, "sec": round(time.time() - t), "events": [e.height for _, e in reps],
                          "gen_info": gi}
     print(f"world {a.world} {arm}: {[e.height for _, e in reps]} events, {time.time() - t:.0f}s", flush=True)
     del model

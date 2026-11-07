@@ -72,8 +72,9 @@ class FeePool:
 
 
 @torch.no_grad()
-def generate(model, conds: list[dict], store, dev="cuda", seed=7, max_events=10000, tok_budget=65536, log=print):
-    """conds: dicts with role, cohort, origin, prof (model input vector), b0. Returns (agents_df, events_df, info)."""
+def generate(model, conds: list[dict], store, dev="cuda", seed=7, max_events=10000, tok_budget=65536, log=print, sweeper=None):
+    """conds: dicts with role, cohort, origin, prof (model input vector), b0. Returns (agents_df, events_df, info).
+    sweeper: an optional lpw.p1.sweep.Sweeper (P3a addendum A); None leaves generation unchanged."""
     model.eval()
     g = torch.Generator(device=dev).manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -104,7 +105,7 @@ def generate(model, conds: list[dict], store, dev="cuda", seed=7, max_events=100
             views = [streams[i].view() for i in ch]
             specs = [(max(0, v_n - CTX), np.array([v_n - max(0, v_n - CTX)])) for v_n in (streams[i].n for i in ch)]
             B = to_torch(collate(views, specs, V, store.w_start, sample=True), dev)
-            res = _step(model, B, g, venue_sc, store, rng, fees, [streams[i] for i in ch])
+            res = _step(model, B, g, venue_sc, store, rng, fees, [streams[i] for i in ch], sweeper)
             for i, keep in zip(ch, res):
                 if keep and streams[i].n < max_events:
                     nxt.append(i)
@@ -112,10 +113,12 @@ def generate(model, conds: list[dict], store, dev="cuda", seed=7, max_events=100
                     done_reason[i] = "cap"
         active = nxt
     info = {"rounds": rounds, "capped": sum(1 for r in done_reason.values() if r == "cap")}
+    if sweeper is not None:
+        info["sweep"] = {"n_out": sweeper.n_out, "n_eligible": sweeper.n_eligible, "n_sweep": sweeper.n_sweep}
     return _frames(streams, conds), info
 
 
-def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
+def _step(model, B, g, venue_sc, store, rng, fees, streams, sweeper=None) -> list[bool]:
     with torch.autocast("cuda", dtype=torch.float16):
         Hk, Ho = model.encode(B)
     Hk, Ho = Hk.float(), Ho.float()
@@ -164,10 +167,20 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
         ven[vv] = v
         cpvec[vv] = model.e_venue(v)
     led = B["o_led"][idx]
+    if sweeper is not None:
+        model._capture = {}
     ap = model.amount_params(B, rb[idx], ctx, cls, cpvec, led)
+    amt_x = model._capture["amt_x"] if sweeper is not None else None
+    model._capture = None if sweeper is not None else model._capture
     amt = _sample_trunc_mog(ap, model.cfg.k_mix, g).cpu().numpy()
     k_np, c_np, e_np, v_np = ko.cpu().numpy(), cls.cpu().numpy(), ent.cpu().numpy(), ven.cpu().numpy()
     fee = fees.sample(t_np, rng)
+    sweep = np.zeros(len(k_np), bool)
+    if sweeper is not None:  # the fee drawn above is reused for eligibility, amount and ledger
+        oi = np.flatnonzero(k_np == OUT)
+        sw = [streams[w] for w in idx.cpu().numpy()[oi]]
+        sweep[oi] = sweeper.decide(amt_x[torch.as_tensor(oi, device=amt_x.device)], [x.cond for x in sw], [x.n for x in sw],
+                                   np.array([x.b for x in sw]), fee[oi].astype(np.float64), t_np[oi].astype(np.float64))
     h, dw = hour_dow(t_np)
     mon = month_index(t_np, store.w_start)
     bins = dt_bin(dt_np)
@@ -187,8 +200,12 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
             en = len(s.e_tier)
             s.e_tier.append(PERIPHERY), s.e_sc.append(True), s.e_venue.append(-1)
         kk = int(k_np[r])
-        eth = 10.0 ** float(amt[r])
         f = float(fee[r]) if kk == OUT else 0.0
+        if sweep[r]:
+            eth = s.b - f  # exact, in float64
+            amt[r] = np.log10(eth)
+        else:
+            eth = 10.0 ** float(amt[r])
         s.append(dict(kind=kk, ts=float(t_np[r]), cls=c, ent=en, venue=vi, amt=float(amt[r]), eth=eth, fee=f, bal=s.b,
                       dt=float(dt_np[r]), dtbin=int(bins[r]), hour=int(h[r]), dow=int(dw[r]), month=int(mon[r])))
         s.b += -eth - f if kk == OUT else eth

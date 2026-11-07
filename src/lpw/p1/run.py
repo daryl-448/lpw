@@ -164,11 +164,11 @@ def main():
     log(f"exit criteria: {json.dumps(res['exit'])}")
 
 
-def generate_replicas(model, pops: list[list[dict]], store, seed, log):
+def generate_replicas(model, pops: list[list[dict]], store, seed, log, sweeper=None):
     """Generate several populations in one call (they share rounds, so the long tail of a few active streams is not
     paid once per population). Streams are independent, so replica r is exactly a population drawn on its own."""
     sizes = [len(p) for p in pops]
-    (ag, ev), info = generate(model, [c for p in pops for c in p], store, seed=seed, log=log)
+    (ag, ev), info = generate(model, [c for p in pops for c in p], store, seed=seed, log=log, sweeper=sweeper)
     out, lo = [], 0
     for n in sizes:
         sel = (pl.col("agent") >= lo) & (pl.col("agent") < lo + n)
