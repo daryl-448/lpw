@@ -254,4 +254,5 @@ alternative O variants.
    The rule is now a 0.1% capped share, plus the capped-removed sensitivity analysis. The profile + confounder C2ST
    at Checkpoint 0 reports how coherent the sampled profiles are.
 
-**After the readout:** none yet.
+**After the readout (`reports/p3a_readout.md`):** no protocol change. The Checkpoint 0 diagnosis (world 0) and one
+exploratory C2ST probe (with and without BAL) are labelled as such. Their scripts are in `reports/p3a/`.
