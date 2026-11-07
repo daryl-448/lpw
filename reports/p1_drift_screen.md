@@ -31,6 +31,15 @@ Sol r2, the cap gate is relative (policy (b) below) and the absolute gates stay 
 for any plan. B's full-val prior-mode safety counts are measured and disclosed before R is fitted; the policy will not be
 changed again on the basis of B's (or any arm's) counts.
 
+**Full-val B safety disclosure (2026-11-07; no policy amendment).** After the r2 safety-policy freeze and before any
+full-size C / R fitting or evaluation, B was measured on 3741 val agents with three replicas, PlanPrior RNG 101,
+generation seed 7 and cap 10,000. Per-replica counts were: capped [0, 0, 0], finite-plan N > 3U [1, 4, 0], nonempty
+zero-plan [0, 3, 0], and same-second runs > 1330 [0, 0, 0]. The three zero-plan streams each contain one IN_EXO event
+and are also included in N > 3U; these are five distinct violating streams, not eight. Full diagnostics are retained
+in `runs/p1_drift/2018/B_safety.json`. B therefore fails both absolute plan-related criteria. We retain P unchanged
+under the r2 no-switch commitment (Sol consult, same day), accepting that R must eliminate these observed violations to
+pass. Passing establishes zero observed violations on these registered draws, not a zero population failure rate.
+
 ## Arms (2018, base `runs/p1_r0/2018/lpw_plan_prog_rp`, one seed 20261104)
 
 | arm | training |
@@ -130,12 +139,16 @@ Both arms (identical except J):
 - Each must satisfy R <= B.
 - reach-100: R >= C and R >= B.
 
-**P. Safety (prior mode, all 3 replicas; amended r2, policy (b)).**
-- Capped streams (N reaching 10,000), pooled over the 3 replicas: R <= B and R <= C.
-- Absolute, all replicas:
-  - zero finite-plan streams with N > 3U, where U is the plan bucket's upper count;
-  - zero nonempty zero-plan streams;
-  - zero same-second runs longer than 10 x the real-training maximum (133 in 2018; recomputed and recorded).
+**P. Safety (prior mode, all 3 replicas; amended r2, policy (b)).** Using the registered full-val prior-mode population,
+plans, seeds, cap and three replicas, P passes iff:
+- R's capped-stream count (N reaching 10,000), pooled over replicas, is <= B's and <= C's.
+- R has zero finite-plan streams with N > 3U across all replicas, where U is the largest integer count in the plan
+  bucket, including U = 0.
+- R has zero nonempty zero-plan streams across all replicas, including single IN_EXO events.
+- R has zero streams with a same-second run > 10 x the recorded real-training maximum (133 in 2018, so > 1330).
+
+N counts all generated owned events (OUT and IN_EXO). The conditions are conjunctive and apply to the already-selected
+R checkpoint; no runner-up substitution or refitting follows a failure. B and C need not pass P.
 - Reported, not gated:
   - capped counts per replica, split into finite-plan and open-bucket plans;
   - the longest run per replica;
