@@ -222,6 +222,9 @@ alternative O variants.
 
 ## 13. Sealed test
 
+- **Scope decision (2026-11-07, user option B):** P3b belongs in the confirmatory package, so the test stays sealed
+  until P3b is developed and its protocol frozen. P3a's test protocol (kct primary, B control, worlds 0-2, no
+  rejected sweep arm) is frozen in an addendum before opening.
 - **When:** opened once, after the user authorizes, and after deciding which stages belong in the frozen evaluation.
 - **How:** the same scripts with real train → **test**. TRTR is also reported on the clean test subset (SPEC §5.2).
 - **Afterwards:** nothing is tuned, and negative results are confirmed too.
@@ -341,4 +344,70 @@ change any P1 qualification claim, and success would not qualify P3 overall.
 
 **REJECTED** on the scam mechanism gate (0.126 vs band 0.204-0.611). Normal mechanism, fidelity and safety pass.
 The labelled readout and diagnostics were run once, as pre-registered: `reports/p3a_sweep.md`. Deviations: none.
+
+## 16. Addendum B (2026-11-07, before implementation): encoder mode-coverage tranche
+
+The design is Sol's (scratch `sol_consult_next/consult.md`); the user approved the sequence (option B).
+
+**Status.** A **supplementary** coverage measurement:
+- It is not a gate, and neither result makes C2 pass.
+- Tabular P/R (§8) stays the primary coverage analysis, unchanged.
+- No alternative recipe is searched.
+
+### B.1 Encoder (one fixed recipe)
+
+**Architecture.** A shared, role-blind, one-layer GRU (hidden size 64), then a linear projection to 32 dimensions
+and L2 normalization. An agent's embedding is the projection of the final hidden state over its **complete**
+observed sequence, with no truncation.
+
+**Training data.** Observed **real train** sequences only (the P3a O schema: integer seconds, all incident events,
+one IN category, stable same-second order).
+- Agents are sampled uniformly, with no role oversampling.
+- No synthetic data, no val, no test.
+
+**Per-event inputs:**
+- OUT / IN one-hot;
+- log1p gap in seconds (0 for the first event) and a first-event flag;
+- log10 ETH amount;
+- log1p(fee / 1e-9 ETH);
+- sine / cosine of UTC hour and weekday;
+- a venue flag;
+- a previously-seen-counterparty flag.
+
+The three log scalars are standardized with all real-train events, and a zero SD becomes 1.
+
+**Excluded inputs:** partner or venue IDs, role, cohort, age, profile, plan, absolute dates and the balance. The
+balance is left out on purpose: this is a sequence-only view.
+
+**Objective.** CoLES-style positive pairs:
+- views: two independent contiguous crops of length ceil(0.8 n), at least 1 event; one-event agents are kept;
+- regularization: dropout 0.1 before the projection, during training only;
+- loss: symmetric NT-Xent with temperature 0.1, where the other agents in the batch are the negatives.
+
+**Optimization.** Batch of 64 distinct agents; AdamW with lr 1e-3 and weight decay 1e-4; 20 fixed epochs; seed 0;
+the final epoch is used. No early stopping, no search, no checkpoint selection.
+
+**Before any val scoring:**
+- the weights, normalizer, input schema, code and embedding outputs are hashed;
+- train-only checks are recorded: finite loss, finite embeddings, coordinate dispersion.
+
+**Budget.** ≤ 1 GPU-hour, fit plus inference.
+- If the recipe cannot finish within it, the result is INCOMPLETE.
+- A collapsed or invalid representation is reported as such and triggers no new search.
+- A technical bug fix is disclosed and counts toward the budget.
+
+### B.2 Coverage scoring
+
+- **Sources:** the existing holdout worlds 0, 1 and 2 for kct and B, against real val. No new generation, no sweep
+  arm.
+- **Metric:** improved precision and recall (k = 5, self-neighbours excluded from the radii, Euclidean distance on
+  the unit embeddings), per role.
+- **Banned:** a k sweep, PCA, whitening, a learned distance, and pooling roles, arms or worlds.
+- **Sampling:** n_r = min(real val role count, the role count of each of the 6 synthetic holdouts).
+  - One deterministic seed-0 draw without replacement per source, with the real draw shared across comparisons.
+  - The IDs are saved.
+  - If n_r ≤ 5, the result is "not estimable".
+- **Reported:** n_r, each world's P/R, and the per-arm mean and SD over worlds (reported as spread). No pass
+  threshold and no bootstrap.
+- **For the sealed test:** the same frozen encoder and rule.
 
