@@ -1,7 +1,13 @@
 """Drift experiment harness (2018 by default): 5-seed paired generation from a checkpoint with plan mode
 none | oracle | prior, drift-specific readouts, M-pass at full length and with both sides cut to 5 events, val NLL.
 
-usage: uv run python -m lpw.p1.drift_exp --ckpt DIR --model lpw|lpw_plan --mode none|oracle|prior --out FILE.json [--pilot data/pilot_2018]
+usage: uv run python -m lpw.p1.drift_exp --ckpt DIR --model lpw|lpw_plan --mode MODE --out FILE.json [--pilot data/pilot_2018]
+
+Plan modes: none; oracle (real val plans); prior (PlanPrior); and, for the prior-mode loss decomposition
+(reports/p1_prior.md):
+- prior_exp: the exposure-aware PlanPrior;
+- perm: the real joint plans permuted among val agents of the same role x cohort;
+- perm_a: real count buckets, with amount buckets permuted among val agents of the same role x count bucket.
 """
 import argparse, json, time
 import numpy as np, polars as pl
@@ -16,7 +22,8 @@ from lpw.p1.plan import PlanPrior, count_bucket
 from lpw.p1.atomic import atomic_path, write_text
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--ckpt", required=True); ap.add_argument("--model", default="lpw"); ap.add_argument("--mode", default="none")
+ap.add_argument("--ckpt", required=True); ap.add_argument("--model", default="lpw")
+ap.add_argument("--mode", default="none", choices=["none", "oracle", "prior", "prior_exp", "perm", "perm_a"])
 ap.add_argument("--out", required=True); ap.add_argument("--pilot", default="data/pilot_2018"); ap.add_argument("--seeds", type=int, default=5)
 ap.add_argument("--no-nll", action="store_true")
 ap.add_argument("--cuts", default="5", help="comma list of k: M-pass with both sides cut to the first k events")
@@ -32,15 +39,34 @@ groups = groups_for(rag, edges)
 base = [dict(role=int(st.role[x]), cohort=int(st.cohort[x]), origin=int(st.origin[x]), prof=st.prof_vec(x), b0=float(st.b0[x]),
              age_days=float(st.prof_raw[x, 17])) for x in va]
 rng = np.random.default_rng(101)
+
+
+def permute_within(*keys):
+    """an index permutation that only swaps agents with equal keys"""
+    _, inv = np.unique(np.stack(keys, 1), axis=0, return_inverse=True)
+    out = np.arange(len(inv))
+    for k in range(inv.max() + 1):
+        m = np.nonzero(inv == k)[0]
+        out[m] = rng.permutation(m)
+    return out
+
+
 pops, plans, plans_a = [], [], []
 if a.mode == "none":
     pops = [base] * a.seeds
 else:
     model.plan_inference = True
-    prior = PlanPrior(st) if a.mode == "prior" else None
+    prior = PlanPrior(st, exposure=a.mode == "prior_exp") if a.mode in ("prior", "prior_exp") else None
     for _ in range(a.seeds):
         if a.mode == "oracle":
             pn, pa_ = st.plan_n[va], st.plan_a[va]
+        elif a.mode == "perm":
+            i = permute_within(st.role[va], st.cohort[va])
+            pn, pa_ = st.plan_n[va][i], st.plan_a[va][i]
+        elif a.mode == "perm_a":
+            pn, pa_ = st.plan_n[va], st.plan_a[va][permute_within(st.role[va], st.plan_n[va])]
+        elif a.mode == "prior_exp":
+            pn, pa_ = prior.sample(st.role[va], st.cohort[va], np.stack([c["prof"] for c in base]), rng, origin=st.origin[va])
         else:
             pn, pa_ = prior.sample(st.role[va], st.cohort[va], np.stack([c["prof"] for c in base]), rng)
         plans.append(pn), plans_a.append(pa_)
