@@ -336,3 +336,9 @@ change any P1 qualification claim, and success would not qualify P3 overall.
   - a budget or technical failure is reported as inconclusive;
   - nothing is retuned: no seed replacement, no wider band, no second head, no backbone change, no utility-based
     rescue. A demonstrable bug fix is allowed within budget, disclosed, and rerun with the same seeds.
+
+### A.6 Outcome (2026-11-07)
+
+**REJECTED** on the scam mechanism gate (0.126 vs band 0.204-0.611). Normal mechanism, fidelity and safety pass.
+The labelled readout and diagnostics were run once, as pre-registered: `reports/p3a_sweep.md`. Deviations: none.
+
