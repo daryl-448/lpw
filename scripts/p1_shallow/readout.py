@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--pilot", default="data/pilot_2018")
     ap.add_argument("--donors", type=int, default=3)
     ap.add_argument("--boot", type=int, default=50)
+    ap.add_argument("--tag", default="", help="output name suffix, e.g. _v2 for a rescoring that keeps the earlier files")
     a = ap.parse_args()
     root = Path(a.root)
     st = build_store(Path(a.pilot))
@@ -176,7 +177,7 @@ def main():
                          "prior-mode normal M-pass not below B": g["normal_prior_diff"] >= 0}
         dec["outcome"] = ("PROMOTE" if (ok_t and ok_l and promote) else "KILL" if not (ok_t and ok_l) else "STOP PROMOTION")
     res["decision"] = dec
-    write_text(root / "readout.json", json.dumps(res, indent=1, default=float))
+    write_text(root / f"readout{a.tag}.json", json.dumps(res, indent=1, default=float))
 
     L = [f"primary variant: {prim}; outcome: {dec['outcome']}", json.dumps(dec.get("checks", {}), indent=1)]
     for mode in ("oracle", "prior"):
@@ -194,7 +195,7 @@ def main():
              + " | ".join(f"{arm} {res['oracle'][arm]['light_generated']['d1_out']:.3f} / {res['oracle'][arm]['light_generated']['d1_in_repeat']:.3f}" for arm in ARMS))
     for arm in ARMS:
         L.append(f"safety prior {arm}: {res['prior'][arm]['safety']}; s-unknown val NLL {(res['oracle'][arm].get('val_nll_s_unknown') or {}).get('nll_full')}")
-    write_text(root / "readout.txt", "\n".join(L) + "\n")
+    write_text(root / f"readout{a.tag}.txt", "\n".join(L) + "\n")
     print("\n".join(L))
 
 

@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--base-gen", default="runs/p1_shallow/2018/gen")
     ap.add_argument("--pilot", default="data/pilot_2018")
     ap.add_argument("--boot", type=int, default=50)
+    ap.add_argument("--tag", default="", help="output name suffix, e.g. _v2 for a rescoring that keeps the earlier files")
     a = ap.parse_args()
     root = Path(a.root)
     st = build_store(Path(a.pilot))
@@ -90,7 +91,7 @@ def main():
         for g in ("normal", "scam"):
             d = np.array(res["per_replica"][x][g]) - np.array(res["per_replica"][y][g])
             res["contrasts"][name][g] = {"diff": float(d.mean()), "sd": float(d.std())}
-    write_text(root / "decompose.json", json.dumps(res, indent=1, default=float))
+    write_text(root / f"decompose{a.tag}.json", json.dumps(res, indent=1, default=float))
 
     L = [f"M-pass / gmean ({ARM}, {len(seeds)} replicas, shared split seeds)"]
     for g in G:
@@ -106,7 +107,7 @@ def main():
                                            for rn, v in res["plans"][s].items()))
     worst = {s: sorted(res["fidelity"][s]["normal"]["ratios"].items(), key=lambda kv: -kv[1])[:5] for s in SOURCES}
     L.append("normal top ratios: " + " | ".join(f"{s} " + " ".join(f"{m}:{v:.2f}" for m, v in w) for s, w in worst.items()))
-    write_text(root / "decompose.txt", "\n".join(L) + "\n")
+    write_text(root / f"decompose{a.tag}.txt", "\n".join(L) + "\n")
     print("\n".join(L))
 
 

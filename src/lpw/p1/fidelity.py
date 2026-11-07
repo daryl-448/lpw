@@ -131,12 +131,15 @@ def distance(kind: str, metric: str, x: np.ndarray, y: np.ndarray) -> float:
 def compare(real: Sample, synth: Sample, groups: dict[str, np.ndarray], paired: bool, n_boot=20, seed=0,
             synth_groups: dict[str, np.ndarray] | None = None) -> dict:
     """groups: name → real agent ids. Paired: synthetic agent i is the stream of real agent i.
-    Unpaired: synth_groups gives the synthetic ids of each group."""
-    rng = np.random.default_rng(seed)
+    Unpaired: synth_groups gives the synthetic ids of each group.
+    Each group gets its own rngs from seed (amended 2026-11-07): one rng running through the groups made a group's
+    floors depend on which groups preceded it. The real half-splits and the unpaired synthetic draw use separate
+    streams, so a group's floors depend only on (seed, its real agents), paired or not."""
     out = {}
     for gname, R in groups.items():
         if len(R) < 4:
             continue
+        rng, srng = np.random.default_rng(seed), np.random.default_rng([seed, 1])
         S = R if paired else synth_groups[gname]
         res = {}
         todo = [(m, kind) for _, m, kind in METRICS] + [(m, "w1") for m in M1_KINDS]
@@ -145,7 +148,7 @@ def compare(real: Sample, synth: Sample, groups: dict[str, np.ndarray], paired: 
             p = rng.permutation(R)
             h = len(p) // 2
             R1, R2 = p[:h], p[h:2 * h]
-            S1 = R1 if paired else rng.choice(S, size=min(h, len(S)), replace=False)
+            S1 = R1 if paired else srng.choice(S, size=min(h, len(S)), replace=False)
             for m, kind in todo:
                 r2 = real.values(m, R2)
                 boots[m][0].append(distance(kind, m, real.values(m, R1), r2))

@@ -37,3 +37,31 @@ def test_drop_largest_group_removes_the_group_with_most_real_events():
     assert big == 0
     assert not np.isin(np.arange(4), np.concatenate(list(g2.values()))).any()
     assert len(g2["normal"]) == len(groups_for(ag)["normal"]) - 2
+
+
+def test_a_groups_scores_do_not_depend_on_the_other_groups_or_their_order():
+    """regression: one rng ran through the groups, so a group's floors depended on the groups before it."""
+    ag, ev = _frames(40)
+    real = Sample(ag, ev, W0)
+    rng = np.random.default_rng(1)
+    syn = Sample(ag, ev.with_columns(amt=pl.col("amt") + pl.Series(rng.normal(0, 0.5, ev.height).astype(np.float32))), W0)
+    G = groups_for(ag)
+    names = [g for g, R in G.items() if len(R) >= 4]
+    joint = compare(real, syn, G, paired=True, n_boot=5, seed=3)
+    rev = compare(real, syn, dict(reversed(list(G.items()))), paired=True, n_boot=5, seed=3)
+    for g in names:
+        alone = compare(real, syn, {g: G[g]}, paired=True, n_boot=5, seed=3)[g]
+        for o in (joint[g], rev[g]):
+            assert [o[m]["floor"] for m in ("M1", "M2", "M11")] == [alone[m]["floor"] for m in ("M1", "M2", "M11")]
+            assert o["pass_rate"] == alone["pass_rate"] and o["ratio_gmean"] == alone["ratio_gmean"]
+
+
+def test_unpaired_floors_equal_paired_floors():
+    """the unpaired synthetic draw has its own stream, so the real half-split floors are the paired ones"""
+    ag, ev = _frames(40)
+    real = Sample(ag, ev, W0)
+    G = groups_for(ag)
+    pa = compare(real, real, G, paired=True, n_boot=5, seed=4)
+    un = compare(real, real, G, paired=False, n_boot=5, seed=4, synth_groups=G)
+    for g in pa:
+        assert all(pa[g][m]["floor"] == un[g][m]["floor"] for m in ("M1", "M3", "M11", "M16"))
