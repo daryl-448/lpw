@@ -184,3 +184,29 @@ Local GTX 1650S, measured on the pilot:
 - generation and fidelity not yet timed at full size.
 
 Expected 2-3 h locally (no rented GPU); the user is asked before a run that exceeds 4 h.
+
+## Result (2026-11-07): FAILS
+
+Full local run, commit 2336872, `runs/p1_drift/2018/` (`run.log`, `select.json`, `screen.{json,txt}`, `B_safety.json`);
+53 min on the GTX 1650S. No updates were skipped.
+
+**Selection.**
+- C selects step 0 (= B). Steps 200, 400 and 800 are infeasible (worst val cell up to +0.039).
+- R selects step 400: shift ratio 0.982. The lower ratios at 800 and 1200 (0.977, 0.969) are infeasible.
+- R's budget: val unknown-plan all +0.0015, plan >= 300 +0.0115.
+
+| gate | outcome |
+|---|---|
+| S shift sensitivity | FAIL: R vs C reduction 1.8% (e_tt) and 2.4% (e_aa) vs the 25% required; both bootstrap lower bounds > 0; R <= B |
+| D rollout discrepancy | FAIL: R worse than C / B (time -3%, amount -10%); R's d99 coverage 0.64 vs 0.75 |
+| G pilot generation | FAIL: pace 0.1766 -> 0.1806, amount W1 0.3173 -> 0.3574, reach-100 0.380 -> 0.349 |
+| P safety | FAIL: capped 0 (pass); finite-plan N > 3U [0, 3, 0] (B [1, 4, 0]); nonempty zero-plan [0, 3, 0] (as B); runs > 1330 none (pass) |
+| F fidelity | PASS: normal ratio_gmean 1.805 -> 1.558 (all), 1.906 -> 1.643 (largest group dropped); scam 1.212 -> 1.197, 1.243 -> 1.229 |
+
+**Interpretation.**
+- J at the calibrated weight moved the forecast shift sensitivities only by a few percent within the likelihood
+  budget. The mechanism (S) is not met, and the rollout gates (D, G) went the wrong way.
+- The prior-mode fidelity improvement (F) is a passing secondary gate on a failed screen. It is not evidence for the
+  mechanism, and under this registration it cannot rescue the recipe.
+- Per the registration: no threshold relaxation, runner-up substitution or refitting. The recipe is not frozen and no
+  sealed-test evaluation follows.
