@@ -225,8 +225,12 @@ def load_eval(ctx, arm, step):
     for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):  # every prefix of the registered population, once, aligned across modes
         w, k = E[f"who_{sname}_known"], E[f"k_{sname}_known"]
         assert np.array_equal(E[f"who_{sname}"], w) and np.array_equal(E[f"who_{sname}_unknown"], w) and np.array_equal(E[f"k_{sname}_unknown"], k)
-        assert all(len(E[f"nll_{sname}_{m_}"]) == len(w) for m_ in ("known", "unknown"))
+        for m_ in ("known", "unknown"):
+            assert len(E[f"nll_{sname}_{m_}"]) == len(w), f"eval of {arm} step {step}: {sname} {m_} NLL length"
+            assert np.isfinite(E[f"nll_{sname}_{m_}"]).all(), f"eval of {arm} step {step}: non-finite {sname} {m_} NLL"
         assert check_prefixes(w, k, agents, st.n_events, st.origin, st.obs_end), f"eval of {arm} step {step}: {sname} prefixes not exactly the population's"
+    for k_ in ("e_tt", "e_at", "e_ta", "e_aa"):
+        assert len(E[k_]) == len(E["item_agent"]) and np.isfinite(E[k_]).all(), f"eval of {arm} step {step}: non-finite / misaligned {k_}"
     return E
 
 

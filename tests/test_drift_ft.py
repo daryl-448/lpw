@@ -159,3 +159,51 @@ def test_check_prefixes_requires_each_prefix_exactly_once():
     assert not S.check_prefixes(who, np.array([0, 1, 1, 3, 0, 1]), [0, 1, 2], n, origin, obs_end)   # a duplicate hides an omission
     assert not S.check_prefixes(who[:-1], pk[:-1], [0, 1, 2], n, origin, obs_end)                    # missing prefix
     assert not S.check_prefixes(np.append(who, 2), np.append(pk, 0), [0, 1, 2], n, origin, obs_end)  # unobserved agent present
+
+
+def _fake_eval(tmp_path, S):
+    """a minimal valid v3 evaluation artifact and the context load_eval needs (two agents, n = 3 and 1)."""
+    from types import SimpleNamespace
+    ck = tmp_path / "base"
+    ck.mkdir()
+    (ck / "model.pt").write_bytes(b"weights")
+    st = SimpleNamespace(n_events={0: 3, 1: 1}.__getitem__, origin=np.array([0, 0]), obs_end=np.array([5, 5]))
+    ctx = SimpleNamespace(root=tmp_path, st=st, ret=np.array([1]), va=np.array([0, 1]),
+                          ckpt=lambda arm, step: ck, eval_pop_sha=lambda: "pop")
+    E = {"sha": np.array(D.file_sha(ck / "model.pt")), "version": np.array(S.EVAL_VERSION), "pop_sha": np.array("pop"),
+         "item_agent": np.array([0, 1])}
+    for sname, w, k in (("retention", [1, 1], [0, 1]), ("val", [0, 0, 0, 0, 1, 1], [0, 1, 2, 3, 0, 1])):
+        E[f"who_{sname}"] = np.array(w)
+        for m in ("known", "unknown"):
+            E[f"who_{sname}_{m}"], E[f"k_{sname}_{m}"] = np.array(w), np.array(k)
+            E[f"nll_{sname}_{m}"] = np.ones(len(w))
+    for k in ("e_tt", "e_at", "e_ta", "e_aa"):
+        E[k] = np.zeros(2)
+    return ctx, E
+
+
+def test_load_eval_rejects_non_finite_and_misaligned_artifacts(tmp_path):
+    import pytest
+    S = _screen()
+    ctx, E0 = _fake_eval(tmp_path, S)
+    (tmp_path / "eval").mkdir()
+
+    def save_and_load(E):
+        np.savez(tmp_path / "eval" / "B_0000.npz", **E)
+        return S.load_eval(ctx, "B", 0)
+
+    save_and_load(E0)  # valid
+    for key, bad in (("nll_val_known", np.nan), ("nll_val_unknown", -np.inf), ("nll_retention_known", np.inf), ("e_aa", np.nan)):
+        E = {k: v.copy() for k, v in E0.items()}
+        E[key] = E[key].astype(float)
+        E[key][0] = bad
+        with pytest.raises(AssertionError):
+            save_and_load(E)
+    E = {k: v.copy() for k, v in E0.items()}
+    E["k_val_unknown"] = np.array([0, 1, 2, 3, 1, 0])   # modes not aligned
+    with pytest.raises(AssertionError):
+        save_and_load(E)
+    E = {k: v.copy() for k, v in E0.items()}
+    E["pop_sha"] = np.array("other")
+    with pytest.raises(AssertionError):
+        save_and_load(E)
