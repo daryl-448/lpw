@@ -122,7 +122,8 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
     rb, rj, t0 = B["row_b"], B["row_j"], B["row_t0"]
     n = len(rb)
     hk, ho = Hk[rb, rj], Ho[rb, rj]
-    logpk, law, _ = model.kind_time(hk, ho, t0, **model.row_extras(B))
+    ex = model.row_extras(B)
+    logpk, law, _ = model.kind_time(hk, ho, t0, **ex)
     kappa = torch.multinomial(torch.exp(logpk), 1, generator=g)[:, 0]
     dt2, dorm2 = law.sample(g)
     sel = torch.arange(n, device=rb.device) * 2 + kappa
@@ -145,7 +146,7 @@ def _step(model, B, g, venue_sc, store, rng, fees, streams) -> list[bool]:
     Bsub["role"] = B["role"]
     ctx = model.cp_context(B, rb[idx], ho[idx], ko, tt)
     ent_ok, ven_ok = model.masks(Bsub, ko)
-    lg = model.gate_logp(ctx, ent_ok, ven_ok)
+    lg = model.gate_logp(ctx, ent_ok, ven_ok, ex["shallow"][0][idx] if "shallow" in ex else None, ko)
     cls = torch.multinomial(torch.exp(lg), 1, generator=g)[:, 0]
     ent = torch.full_like(cls, -1)
     ven = torch.full_like(cls, -1)

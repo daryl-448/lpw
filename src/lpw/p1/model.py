@@ -45,6 +45,7 @@ class Cfg:
     progress: bool = False  # plan progress state -> learned residual on the dormant-atom logit (needs plan)
     pace: bool = False     # history-free pace reference + mean shrinkage of the time law (lpw.p1.pace; post-hoc only)
     anchor: bool = False   # plan-conditioned residual adapters on the time and amount heads (lpw.p1.anchor)
+    shallow: str = ""      # shallow-row correction offsets, a key of lpw.p1.shallow.VARIANTS ("" = none)
 
 
 CONFIGS = {
@@ -58,6 +59,10 @@ CONFIGS = {
     "lpw_plan_prog": Cfg("lpw_plan_prog", plan=True, progress=True),
     "lpw_plan_prog_pace": Cfg("lpw_plan_prog_pace", plan=True, progress=True, pace=True),
     "lpw_plan_prog_anchor": Cfg("lpw_plan_prog_anchor", plan=True, progress=True, anchor=True),
+    # shallow-row correction on the plan-progress base (runs/p1_diag/after_v2; lpw.p1.shallow): kind / +cp / +time
+    "lpw_plan_prog_shallow_k": Cfg("lpw_plan_prog_shallow_k", plan=True, progress=True, shallow="k"),
+    "lpw_plan_prog_shallow_kc": Cfg("lpw_plan_prog_shallow_kc", plan=True, progress=True, shallow="kc"),
+    "lpw_plan_prog_shallow_kct": Cfg("lpw_plan_prog_shallow_kct", plan=True, progress=True, shallow="kct"),
     # encoder screen (reports/p1_encoder_screen.md)
     "tf_ref": Cfg("tf_ref", indep_init=True),
     "tf_alibi": Cfg("tf_alibi", pos="alibi", indep_init=True),
@@ -127,6 +132,14 @@ def trunc_mog_mean(params, k):
     return (torch.softmax(lw, -1) * m.clamp(DUST_LOG10, SUPPLY_LOG10)).sum(-1)
 
 
+def masked_gate_logp(g, ent_any, ven_any):
+    """log-probs over [REPEAT, VENUE, NEW] from raw gate logits (n, 3): REPEAT needs a valid partner entry, VENUE a
+    valid unseen venue."""
+    neg = torch.full_like(g[:, 0], -1e9)
+    g = torch.stack([torch.where(ent_any, g[:, 0], neg), torch.where(ven_any, g[:, 1], neg), g[:, 2]], -1)
+    return torch.log_softmax(g, -1)
+
+
 def mog_mean(params, k):
     logit, mu, _ = params.split(k, -1)
     return (torch.softmax(logit, -1) * mu).sum(-1).clamp(DUST_LOG10, SUPPLY_LOG10)
@@ -192,6 +205,10 @@ class Model(nn.Module):
             assert cfg.plan and not cfg.pace and not cfg.b2, "anchor adapters sit on the plan model's heads"
             from lpw.p1.anchor import Anchor
             self.anchor = Anchor(d, cfg.k_mix)
+        if cfg.shallow:
+            assert cfg.plan and cfg.progress and not cfg.pace and not cfg.anchor and not cfg.b2 and cfg.enc == "tf"
+            from lpw.p1.shallow import VARIANTS, Shallow
+            self.shallow = Shallow(VARIANTS[cfg.shallow])
         self._capture = None  # dict -> head inputs / base outputs are recorded here (lpw.p1.anchor caching)
         # plan latent at inference: False = unknown (NLL evaluation; no future information), True = use B["plan_*"]
         self.plan_inference = False
@@ -285,12 +302,15 @@ class Model(nn.Module):
             out["pace"] = self.pace.features(B)
         if self.cfg.anchor:
             out["anchor"] = (B["_plan_n_eff"][B["row_b"]], B["_plan_a_eff"][B["row_b"]])
+        if self.cfg.shallow:
+            out["shallow"] = self.shallow.row_offsets(B)
         return out
 
-    def kind_time(self, hk, ho, t0, prog=None, pace=None, anchor=None):
+    def kind_time(self, hk, ho, t0, prog=None, pace=None, anchor=None, shallow=None):
         """Kind log-probs (N, 2) and the time law for both kinds (rows 2i + κ). prog: row_progress, required for
         progress models; pace: pace.features (x, eligible), required for pace models; anchor: the row plans
-        (plan_n, plan_a), required for anchor models (see row_extras)."""
+        (plan_n, plan_a), required for anchor models; shallow: the rows' (offsets (N, shallow.N_OUT), active (N,)),
+        required for shallow models (see row_extras)."""
         logpk = torch.log_softmax(self.kind_head(hk), -1)
         n = hk.shape[0]
         inp = torch.cat([ho[:, None].expand(n, 2, -1), self.e_tkind.weight[None].expand(n, 2, -1)], -1)
@@ -300,6 +320,10 @@ class Model(nn.Module):
         if self.cfg.anchor:
             assert anchor is not None, "anchor model: pass **model.row_extras(B)"
             out = self.anchor.apply_time(out, ho, *anchor)
+        if self.cfg.shallow:
+            assert shallow is not None, "shallow model: pass **model.row_extras(B)"
+            from lpw.p1.shallow import apply_kind, apply_time
+            logpk, out = apply_kind(logpk, *shallow), apply_time(out, shallow[0])
         return self.time_law(logpk, out, t0, prog, pace)
 
     def time_law(self, logpk, out, t0, prog=None, pace=None):
@@ -339,11 +363,14 @@ class Model(nn.Module):
         ven_ok = ~seen[:, :self.V] & (out_k | self.venue_sc[None])
         return ent_ok, ven_ok
 
-    def gate_logp(self, ctx, ent_ok, ven_ok):
+    def gate_logp(self, ctx, ent_ok, ven_ok, shallow=None, ko=None):
+        """log-probs over [REPEAT, VENUE, NEW] with the legality masks; shallow: the owned rows' shallow offsets (with
+        their next kinds ko), for shallow models."""
         g = self.gate(ctx)
-        neg = torch.full_like(g[:, 0], -1e9)
-        g = torch.stack([torch.where(ent_ok.any(-1), g[:, 0], neg), torch.where(ven_ok.any(-1), g[:, 1], neg), g[:, 2]], -1)
-        return torch.log_softmax(g, -1)
+        if shallow is not None:
+            from lpw.p1.shallow import apply_gate
+            g = apply_gate(g, shallow, ko)
+        return masked_gate_logp(g, ent_ok.any(-1), ven_ok.any(-1))
 
     def pointer_logp(self, B, H, oi, rb, rj, ctx, t_tgt, ent_ok):
         """Log-probs over partner entries for owned rows oi (indices into e_*; window rb, position rj), shape (n, P)."""
@@ -399,7 +426,8 @@ class Model(nn.Module):
         rb, rj, typ, t0, r = B["row_b"], B["row_j"], B["row_type"], B["row_t0"], B["row_r"]
         N = len(rb)
         hk, ho = Hk[rb, rj], Ho[rb, rj]
-        logpk, law, tout = self.kind_time(hk, ho, t0, **self.row_extras(B))
+        ex = self.row_extras(B)
+        logpk, law, tout = self.kind_time(hk, ho, t0, **ex)
         if self._capture is not None:
             self._capture.update(logpk_live=logpk, law_live=law)  # with their graph (lpw.p1.drift_ft)
         own = typ == 1
@@ -434,7 +462,7 @@ class Model(nn.Module):
         else:
             ctx = self.cp_context(B, rb[oi], ho[oi], ko, tt)
             ent_ok, ven_ok = self.masks(B, ko)
-            lg = self.gate_logp(ctx, ent_ok, ven_ok)
+            lg = self.gate_logp(ctx, ent_ok, ven_ok, ex["shallow"][0][oi] if "shallow" in ex else None, ko)
             cp = -lg.gather(1, cls[:, None])[:, 0]
             cpvec = torch.zeros_like(ctx)
             rep = cls == REPEAT
