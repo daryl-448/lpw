@@ -49,7 +49,22 @@ Sources: `reports/p3a_prereg.md`, `reports/p3a_readout.md`, `reports/p3a_sweep.m
 | Shortcut audit | **fails**: 7 flags (all 5 balance sentinels, median OUT amount, median fee). Each is a signal the synthetic data **lacks**. None is template-like. |
 | Profile-gain parity | passes, **uninformative**: the profile adds about 0 AUC even on real data |
 | DCR (memorization) | passes, ratios 3.4-7.9 |
-| Mode coverage, tabular (standardized full vectors, k = 5) | normal P / R 0.87 / 0.87; **scam recall 0.57**. This is point coverage in that representation, not "57% of scam typologies". The encoder-space check is pending. |
+| Mode coverage, tabular (standardized full vectors, k = 5) | normal P / R 0.87 / 0.87; **scam recall 0.57**. This is point coverage in that representation, not "57% of scam typologies". |
+| Mode coverage, encoder space (supplementary, addendum B; not a gate) | normal P / R 0.98 / 0.98 (both arms); scam P / R 0.96 / 0.98 (kct), 0.95 / 0.99 (B). n_r 3382 / 307. |
+
+**Encoder coverage (addendum B, `runs/p3a/2018/encoder/`).**
+- **The fit.** One fixed recipe: 20 epochs, loss 0.68 → 0.165, 139 s. The train-only checks passed (finite values,
+  minimum coordinate SD 0.13, mean pairwise cosine 0.003), so the representation did not collapse.
+- **The two analyses disagree for scams.** In a role-blind, balance-free event-sequence view, the synthetic scams
+  sit on the real-val scam manifold and cover it almost entirely: recall 0.98 per world, against 0.57 tabular.
+- **The likely reason, which is not tested.**
+  - The tabular gap comes from aggregate state features (balances, terminal cash-out, amount and fee medians).
+  - The encoder leaves out the balance by design.
+  - This matches the sweep finding: tabular recall rose to 0.94 once sweeps existed.
+- **Caveats.**
+  - Near-saturated P/R may also mean the 32-d CoLES space is coarse in the directions where the roles differ.
+  - No real-vs-real reference was pre-registered, so it cannot be calibrated here.
+  - Tabular stays the primary analysis, and C2 is **not** passed.
 
 **Interpretation.**
 - The synthetic agents carry role signal in the right direction, so detectors learn the right boundary.
@@ -83,8 +98,7 @@ inside confound-matched pairs.
 
 ## Next
 
-1. **Encoder mode-coverage tranche** (addendum B): one fixed, train-only, role-blind sequence encoder. It is a
-   supplementary coverage measurement, not a gate.
+1. ~~Encoder mode-coverage tranche~~ done (above).
 2. **P3b**, inside the confirmatory package:
    - first, the structural-identity control;
    - then one learned GROUP / pool candidate;
