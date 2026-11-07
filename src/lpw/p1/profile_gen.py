@@ -129,6 +129,23 @@ class ProfileGen:
             self.week_hist[r] = np.bincount(w, minlength=int((store.w_end - store.w_start) // (7 * 86400)) + 1).astype(float)
         log(f"profile generator: val NLL {best:.3f} nats/agent, {best_ep + 1} epochs")
 
+    def save(self, path) -> None:
+        """the fitted generator and its train-split rates (no store): a frozen P3 population input"""
+        torch.save({"net": self.net.state_dict(), "binner": self.binner, "p_born": self.p_born, "week_hist": self.week_hist,
+                    "val_nll": self.val_nll, "epochs": self.epochs}, path)
+
+    @classmethod
+    def load(cls, path, store, dev="cuda") -> "ProfileGen":
+        d = torch.load(path, map_location=dev, weights_only=False)
+        self = cls.__new__(cls)
+        self.dev, self.store, self.binner = dev, store, d["binner"]
+        self.mask = torch.tensor(np.arange(NB)[None] < self.binner.nb[:, None], device=dev)
+        self.net = ARNet(len(PROFILE_FIELDS)).to(dev)
+        self.net.load_state_dict(d["net"])
+        self.net.eval()
+        self.p_born, self.week_hist, self.val_nll, self.epochs = d["p_born"], d["week_hist"], d["val_nll"], d["epochs"]
+        return self
+
     def _nll(self, role, bins):
         lg = self.net.logits(role, bins).masked_fill(~self.mask[None], -1e9)
         return -torch.log_softmax(lg, -1).gather(2, bins[..., None])[..., 0].sum(1)
@@ -144,8 +161,9 @@ class ProfileGen:
             bins[:, f] = torch.multinomial(torch.softmax(lg, -1), 1, generator=g)[:, 0]
         return inverse_transform(self.binner.decode(bins.cpu().numpy(), rng))
 
-    def population(self, roles: np.ndarray, rng) -> list[dict]:
-        """Unconditional synthetic agents: cohort, origin, profile and initial balance for each role."""
+    def population(self, roles: np.ndarray, rng, return_raw: bool = False):
+        """Unconditional synthetic agents: cohort, origin, profile and initial balance for each role. With return_raw,
+        also the raw profile fields (n, 20) behind each model vector."""
         st = self.store
         born = rng.random(len(roles)) < np.array([self.p_born[int(r)] for r in roles])
         raw = self.sample_raw(roles, rng)
@@ -154,9 +172,14 @@ class ProfileGen:
         for i in np.flatnonzero(born):
             h = self.week_hist[int(roles[i])]
             wk = rng.choice(len(h), p=h / h.sum())
-            origin[i] = min(st.w_start + wk * 7 * 86400 + int(rng.random() * 7 * 86400), st.w_end - 1)
+            # uniform inside the week's part of W (the last week is partial: clipping a full-week draw to w_end - 1
+            # would pile its mass on the final second)
+            lo = st.w_start + wk * 7 * 86400
+            hi = min(lo + 7 * 86400, st.w_end)
+            origin[i] = lo + int(rng.random() * (hi - lo))
         vec = profile_vector(raw, born.astype(np.int64), st.prof_mu, st.prof_sd)
         bi = PROFILE_FIELDS.index("balance0")
         ai = PROFILE_FIELDS.index("age_days")
-        return [dict(role=int(roles[i]), cohort=int(born[i]), origin=int(origin[i]), prof=vec[i], b0=float(raw[i, bi]),
-                     age_days=float(raw[i, ai])) for i in range(len(roles))]
+        conds = [dict(role=int(roles[i]), cohort=int(born[i]), origin=int(origin[i]), prof=vec[i], b0=float(raw[i, bi]),
+                      age_days=float(raw[i, ai])) for i in range(len(roles))]
+        return (conds, raw) if return_raw else conds
