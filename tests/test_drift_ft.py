@@ -145,3 +145,17 @@ def test_max_run_and_mean_absolute_reduction():
     assert abs(r["reduction"] - 0.5) < 1e-12 and r["lo"] == r["hi"] == 0.5
     # signed values that cancel in a pooled mean still count in the mean absolute discrepancy
     assert S.red(np.array([1.0, -1.0]), np.array([0.1, -0.1]), np.ones((5, 2)))["reduction"] > 0.8
+
+
+def test_check_prefixes_requires_each_prefix_exactly_once():
+    S = _screen()
+    n = {0: 3, 1: 1, 2: 5}.__getitem__
+    origin, obs_end = np.array([0, 0, 9]), np.array([5, 5, 5])   # agent 2 is not observed: no prefixes expected
+    who = np.array([0, 0, 0, 0, 1, 1])
+    pk = np.array([0, 1, 2, 3, 0, 1])
+    assert S.check_prefixes(who, pk, [0, 1, 2], n, origin, obs_end)
+    assert S.check_prefixes(who[::-1], pk[::-1], [0, 1, 2], n, origin, obs_end)               # order-free
+    assert not S.check_prefixes(np.array([0, 0, 0, 1, 1, 1]), np.array([0, 1, 2, 0, 1, 2]), [0, 1, 2], n, origin, obs_end)  # same rows, agent counts [3, 3]
+    assert not S.check_prefixes(who, np.array([0, 1, 1, 3, 0, 1]), [0, 1, 2], n, origin, obs_end)   # a duplicate hides an omission
+    assert not S.check_prefixes(who[:-1], pk[:-1], [0, 1, 2], n, origin, obs_end)                    # missing prefix
+    assert not S.check_prefixes(np.append(who, 2), np.append(pk, 0), [0, 1, 2], n, origin, obs_end)  # unobserved agent present

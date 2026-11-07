@@ -4,7 +4,7 @@ Written before any full-size R snapshot was evaluated (2026-11-07). Reduced plum
 360-agent val subset, 2 replicas, small bootstraps) did evaluate an R step-25 snapshot; they checked the code only,
 and their gate outcomes did not inform the recipe or the thresholds (the one design change they caused is the
 safety amendment below, driven by B). Design: Sol drift-screen-v2 round (after the base
-qualification), amended by Sol build reviews r1 and r2 (r2 amendments marked below; made before any full-size run). Code: `src/lpw/p1/drift_ft.py`, `scripts/p1_drift/screen.py`.
+qualification), amended by Sol build reviews r1-r3 (r2 / r3 amendments marked below; made before any full-size run). Code: `src/lpw/p1/drift_ft.py`, `scripts/p1_drift/screen.py`.
 
 ## Why
 
@@ -89,9 +89,10 @@ Both arms (identical except J):
 
 **Integrity.**
 - Every evaluation and generation artifact is fingerprinted by its checkpoint's sha256 and checked on use.
-- (r2) Each is also bound to its population and recipe version: evaluations store a hash of the val, retention and
-  shift-item populations and must contain every prefix of each population once; generations store a hash of the val and
-  pilot populations. A mismatch aborts.
+- (r2, r3) Each is also bound to its population and recipe version: evaluations store a hash of the val, retention and
+  shift-item populations and every likelihood row's (agent, prefix length) identity; on load, each population's rows must
+  be exactly its prefixes (every prefix once, nothing else), identical in the known- and unknown-plan modes, with finite
+  NLLs. Generations store a hash of the val and pilot populations. A mismatch aborts.
 - The selected checkpoints are re-checked.
 - The C / R recipes must be equal apart from J.
 - Step 0 of each arm must be state-identical to B.

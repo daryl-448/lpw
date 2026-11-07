@@ -45,7 +45,7 @@ PLAN300 = int(np.searchsorted(COUNT_EDGES, 300))  # count bucket index of >= 300
 EV = ("kind", "ts", "cls", "ent", "venue", "amt", "eth", "fee", "bal")
 GEN_RECIPE = {"pilot_reps": PILOT_REPS, "prior_reps": PRIOR_REPS, "pilot_cap": PILOT_CAP, "prior_cap": PRIOR_CAP, "gen_seed": GEN_SEED,
               "plan_seed": PLAN_SEED, "population": "val", "version": 2}
-EVAL_VERSION = 2
+EVAL_VERSION = 3
 
 
 def arr_sha(*arrays) -> str:
@@ -102,19 +102,28 @@ def boot_weights(ctx, agents, seed):
 # ---- likelihood and forecasts ----------------------------------------------------------------------------------------
 @torch.no_grad()
 def rows_nll(ctx, m, agents, known):
-    """exact full NLL per prefix (known or unknown plan) and the prefix's store agent."""
+    """exact full NLL per prefix (known or unknown plan), the prefix's store agent and its length k (events before the target)."""
     m.plan_inference = known
     batches = pack(exact_specs(ctx.st, agents), ctx.views)
-    full, who = [], []
+    full, who, pk = [], [], []
     for bi, b in enumerate(loader(ctx.views, batches)):
         sp = batches[bi]
         b = to_dev(b, "cuda")
         t = m.terms(b)
         kt = (t["kind"] + t["time"] + t["cens"]).double()
         full.append(kt.index_add(0, t["o_row"], (t["cp"] + t["amt"]).double()).cpu().numpy())
-        who.append(np.array([sp[j][0] for j in b["row_b"].cpu().numpy()], np.int64))
+        rb, rj = b["row_b"].cpu().numpy(), b["row_j"].cpu().numpy()
+        who.append(np.array([sp[j][0] for j in rb], np.int64))
+        pk.append(np.array([sp[j][1] for j in rb], np.int64) + rj)
     m.plan_inference = True
-    return np.concatenate(full), np.concatenate(who)
+    return np.concatenate(full), np.concatenate(who), np.concatenate(pk)
+
+
+def check_prefixes(who, pk, agents, n_events, origin, obs_end):
+    """every prefix k = 0..n of every observed agent of the population exactly once, nothing else."""
+    want = [(int(a), k) for a in agents if origin[a] < obs_end[a] for k in range(n_events(int(a)) + 1)]
+    got = sorted(zip(who.tolist(), pk.tolist()))
+    return len(got) == len(set(got)) and got == sorted(want)
 
 
 @torch.no_grad()
@@ -182,9 +191,12 @@ def cmd_eval(ctx, arm, step):
     out = {"sha": np.array(file_sha(ctx.ckpt(arm, step) / "model.pt")), "arm": np.array(arm), "step": np.array(step)}
     for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):
         for mode in ("known", "unknown"):
-            nll, who = rows_nll(ctx, m, agents, mode == "known")
+            nll, who, pk = rows_nll(ctx, m, agents, mode == "known")
+            assert np.isfinite(nll).all(), f"non-finite {sname} {mode} NLL at {arm} step {step}"
             out[f"nll_{sname}_{mode}"] = nll
-            out[f"who_{sname}"] = who
+            out[f"who_{sname}_{mode}"], out[f"k_{sname}_{mode}"] = who, pk
+        assert np.array_equal(out[f"who_{sname}_known"], out[f"who_{sname}_unknown"]) and np.array_equal(out[f"k_{sname}_known"], out[f"k_{sname}_unknown"])
+        out[f"who_{sname}"] = out[f"who_{sname}_known"]
     items = shift_items(ctx)
     vs, ks = [ctx.views(a) for a, _, _ in items], [k for _, _, k in items]
     F = {s: forecast(ctx, m, vs, ks, sh) for s, sh in SHIFTS.items()}
@@ -209,10 +221,12 @@ def load_eval(ctx, arm, step):
     E = dict(np.load(ctx.root / "eval" / f"{'B' if step == 0 else arm}_{step:04d}.npz"))
     assert str(E["sha"]) == file_sha(ctx.ckpt(arm, step) / "model.pt"), f"eval of {arm} step {step} is not of the current checkpoint"
     assert int(E["version"]) == EVAL_VERSION and str(E["pop_sha"]) == ctx.eval_pop_sha(), f"eval of {arm} step {step}: other population / recipe"
-    for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):  # every prefix of the registered population, once
-        n_exp = sum(ctx.st.n_events(int(a)) + 1 for a in agents if ctx.st.origin[a] < ctx.st.obs_end[a])
-        assert len(E[f"who_{sname}"]) == n_exp and np.array_equal(np.unique(E[f"who_{sname}"]),
-                                                                   np.unique([a for a in agents if ctx.st.origin[a] < ctx.st.obs_end[a]]))
+    st = ctx.st
+    for sname, agents in (("retention", ctx.ret), ("val", ctx.va)):  # every prefix of the registered population, once, aligned across modes
+        w, k = E[f"who_{sname}_known"], E[f"k_{sname}_known"]
+        assert np.array_equal(E[f"who_{sname}"], w) and np.array_equal(E[f"who_{sname}_unknown"], w) and np.array_equal(E[f"k_{sname}_unknown"], k)
+        assert all(len(E[f"nll_{sname}_{m_}"]) == len(w) for m_ in ("known", "unknown"))
+        assert check_prefixes(w, k, agents, st.n_events, st.origin, st.obs_end), f"eval of {arm} step {step}: {sname} prefixes not exactly the population's"
     return E
 
 
