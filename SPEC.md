@@ -527,6 +527,27 @@ P4 is intentionally absent: hardening moved to future work (§10).
 - **Reporting:** every P1 result also reports the original criterion, which is currently unmet.
 - **Unchanged:** §6.3 (still a transformer) and every other exit criterion.
 
+**Amendment A2 (2026-11-07): bounded P3 entry after incomplete P1.**
+- **Decision.** After inspecting development results, P1 architecture search stops. It meets neither the original nor
+  the A1 exit criteria. Decided with the user and a Sol design round; recorded in `reports/p1_exit.md`.
+- **Frozen recipe.** kct (`reports/p1_shallow.md`) with the default train-fitted plan prior, for 2018 P3 feasibility.
+  B (its base, without the shallow correction) is kept as a sensitivity control.
+- **Entry requires:** a frozen recipe, documented rollout-safety and role-parity diagnostics, and the B0 likelihood
+  comparison.
+- **What stops gating.** B1 non-inferiority and generation superiority no longer gate entry. B1 / B2 comparisons and
+  every original threshold are still reported, failures included.
+- **Diagnostic targets.** The 70% per-role fidelity and ±0.05 role-AUC thresholds stay as diagnostic targets. They are
+  not retrospectively passed criteria.
+- **P3 requirements.** The utility and criticism-test requirements are unchanged, within the narrowed 2018 scope. They
+  require genuinely sampled populations: P1's prior mode samples plans only, keeping real profiles, cohorts and
+  activation times.
+- **2021.** Its failure (scam M-pass about 0 for every model) is reported, with no cross-era qualification.
+- **P2.** Conditioning is deferred. Mode coverage (§7.4) is still evaluated, with an evaluation-only, train-fitted
+  encoder.
+- **Sealed test.** It stays untouched until an authorized frozen evaluation.
+- **Resuming P1.** Only for an identified P3-blocking defect, under one explicitly bounded experiment with its budget
+  set beforehand.
+
 ## 9. Compute policy
 
 - Before every run longer than a smoke test, project the wall time from measured throughput (tokens/s, events/s).
