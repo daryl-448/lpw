@@ -90,7 +90,8 @@ def incremental(y, draws, trtr_L, trtr_LS, tstr_L: list, tstr_LS_by_arm: dict) -
 
     full = stats(np.arange(len(y)))
     bs = [b for b in (stats(i) for i in draws) if b is not None]
-    out = {"point": full, "n_valid_draws": len(bs), "n_draws": len(draws)}
+    out = {"point": full, "n_valid_draws": len(bs), "n_draws": len(draws),
+           "min_scam_per_draw": int(min(y[i].sum() for i in draws)) if len(draws) else None}  # joint addendum §J4.4
     if len(bs) < MIN_VALID_DRAWS:
         out.update(utility="NOT TESTABLE (bootstrap)", learning="NOT TESTABLE (bootstrap)")
         return out

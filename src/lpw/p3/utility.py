@@ -64,16 +64,25 @@ class GroupBoot:
     def __init__(self, groups: np.ndarray, B: int = 1000, seed: int = 0):
         ug, inv = np.unique(groups, return_inverse=True)
         members = [np.flatnonzero(inv == g) for g in range(len(ug))]
+        if not len(ug):  # an empty evaluation pool: B empty draws, every statistic over them invalid
+            self.idx = [np.array([], np.int64)] * B
+            return
         draws = np.random.default_rng(seed).integers(0, len(ug), (B, len(ug)))
         self.idx = [np.concatenate([members[g] for g in d]) for d in draws]
 
+    def values(self, fn) -> np.ndarray:
+        """fn over every draw, keeping the valid (non-None, finite) values; len() is the valid-draw count."""
+        return np.array([x for x in (fn(i) for i in self.idx) if x is not None and np.isfinite(x)], np.float64)
+
     def ci(self, fn) -> tuple[float, float]:
-        v = [x for x in (fn(i) for i in self.idx) if x is not None and np.isfinite(x)]
+        v = self.values(fn)
         return float(np.quantile(v, 0.025)), float(np.quantile(v, 0.975))
 
     def lower(self, fn, q=0.05) -> float:
-        v = [x for x in (fn(i) for i in self.idx) if x is not None and np.isfinite(x)]
-        return float(np.quantile(v, q))
+        return float(np.quantile(self.values(fn), q))
+
+
+MIN_VALID_FRAC = 0.95  # joint addendum §J4.4: >= 950 of the frozen 1000 draws must be valid two-role draws, else INVALID
 
 
 def auc_or_none(y, s):
@@ -84,6 +93,11 @@ def transfer_contrast(y, tstr_scores: list[np.ndarray], trtr_score: np.ndarray, 
     """Excess-AUC ratio (mean_w TSTR_w - 0.5) / (TRTR - 0.5) and the paired contrast
     D = (mean_w TSTR_w - 0.5) - kappa (TRTR - 0.5), with a group-bootstrap CI over real evaluation groups (evaluation
     uncertainty only: 3 worlds cannot estimate world-to-world variability, which is reported as the spread)."""
+    n_draws, min_scam = len(boot.idx), min_scam_per_draw(y, boot)
+    if not 0 < y.sum() < len(y):  # a one-role or empty evaluation set (a subset): no contrast is defined
+        return {"outcome": "NOT TESTABLE", "reason": "one role or empty", "n": int(len(y)), "n_scam": int(y.sum()), "D": None,
+                "D_ci95": None, "D_lower_1s95": None, "ratio": None, "n_valid_draws": 0, "n_draws": n_draws, "min_scam_per_draw": min_scam}
+
     def D(i):
         a = [auc_or_none(y[i], s[i]) for s in tstr_scores]
         r = auc_or_none(y[i], trtr_score[i])
@@ -91,14 +105,36 @@ def transfer_contrast(y, tstr_scores: list[np.ndarray], trtr_score: np.ndarray, 
     ts = [roc_auc_score(y, s) for s in tstr_scores]
     tr = roc_auc_score(y, trtr_score)
     d = (np.mean(ts) - 0.5) - kappa * (tr - 0.5)
-    lo95 = boot.lower(D, 0.05)
+    v = boot.values(D)
+    valid = len(v) >= MIN_VALID_FRAC * len(boot.idx)
+    lo95 = float(np.quantile(v, 0.05)) if valid else None
+    ci95 = (float(np.quantile(v, 0.025)), float(np.quantile(v, 0.975))) if valid else None
     if tr < 0.60:  # prereg §7 gate: no inferential statistic below it
         outcome = "NOT TESTABLE"
+    elif not valid:
+        outcome = "INVALID"
     else:
         outcome = ("SUPPORTED" if lo95 >= 0 else "CONSISTENT") if d >= 0 else "NOT SUPPORTED"
     return {"tstr_auc_worlds": [float(x) for x in ts], "tstr_auc_mean": float(np.mean(ts)), "tstr_auc_sd": float(np.std(ts)),
-            "trtr_auc": float(tr), "ratio": float((np.mean(ts) - 0.5) / (tr - 0.5)) if tr >= 0.60 else None, "D": float(d), "D_ci95": boot.ci(D),
-            "D_lower_1s95": lo95, "outcome": outcome, "trtr_gate": bool(tr >= 0.60)}
+            "trtr_auc": float(tr), "ratio": float((np.mean(ts) - 0.5) / (tr - 0.5)) if tr >= 0.60 else None, "D": float(d), "D_ci95": ci95,
+            "D_lower_1s95": lo95, "outcome": outcome, "trtr_gate": bool(tr >= 0.60), "n_valid_draws": int(len(v)),
+            "n_draws": n_draws, "min_scam_per_draw": min_scam}
+
+
+def min_scam_per_draw(y, boot_or_draws) -> int | None:
+    """The smallest scam count in any bootstrap draw (joint addendum §J4.4); None without draws."""
+    idx = boot_or_draws.idx if isinstance(boot_or_draws, GroupBoot) else boot_or_draws
+    return int(min(y[i].sum() for i in idx)) if len(idx) else None
+
+
+def contrast_line(h: dict) -> str:
+    """One readout line for a transfer contrast, also when its interval is absent (INVALID, NOT TESTABLE)."""
+    if h.get("tstr_auc_worlds") is None:
+        return f"-> {h['outcome']} ({h.get('reason')})"
+    ci = "n/a" if h["D_ci95"] is None else f"[{h['D_ci95'][0]:+.3f},{h['D_ci95'][1]:+.3f}]"
+    return (f"TSTR {h['tstr_auc_mean']:.3f} ± {h['tstr_auc_sd']:.3f} (worlds {np.round(h['tstr_auc_worlds'], 3).tolist()}) "
+            f"vs TRTR {h['trtr_auc']:.3f}; ratio {h['ratio']}; D {h['D']:+.3f} CI95 {ci} -> {h['outcome']} (TRTR gate {h['trtr_gate']}; "
+            f"valid draws {h['n_valid_draws']}/{h['n_draws']}, min scam per draw {h['min_scam_per_draw']})")
 
 
 def c2st(X_real, X_syn, real_groups, seed=SEED, folds=5) -> float:

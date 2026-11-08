@@ -15,7 +15,12 @@ Frozen sampling choices (prereg §P8, implementation detail fixed here):
   the order A, B, synthetic, shared by the attachment arms;
 - daily selection: default_rng(SeedSequence([6000 + s, w, day])) draws m_d agents from A, then B, then the synthetic
   subset (shared by the attachment arms and the anchor).
-Writes runs/p3b/2018/readout.{json,txt} and readout_predictions.npz, readout_samples.npz.
+Writes OUT/readout.{json,txt} and readout_predictions.npz, readout_samples.npz (OUT defaults to runs/p3b/2018).
+
+Joint addendum (reports/p3_joint_addendum.md): --split names the evaluation split (val, or test only after
+lpw.sealed.authorize() in this process); result keys keep their development names ("real_val", "..._val") and hold the
+evaluation split, recorded in res["eval_split"]. Added: clean-subset analyses (§J4.3), evaluation-group summary (§J4.5);
+the val-only 348-pair assertion is removed (§J4.2).
 """
 import argparse
 import hashlib
@@ -36,7 +41,7 @@ from lpw.p3.matching import MIN_PAIRS, Matcher  # noqa: E402
 from lpw.p3.utility import (DETECTORS, PRIMARY, GroupBoot, fit_score, matched_prevalence_ap, scores, shortcut_audit,  # noqa: E402
                             transfer_contrast)
 from lpw.p3b import evaluate as E  # noqa: E402
-from lpw.p3b.access import load, real_pop  # noqa: E402
+from lpw.p3b.access import clean_agents, load, real_pop  # noqa: E402
 from lpw.p3b.graph import CORE, STRUCT, core_measurements, struct_features, w1  # noqa: E402
 from lpw.p3b.replay import replay  # noqa: E402
 from lpw.p3b.topology import DAILY, S_AGENT, S_PERIPHERY, S_VENUE, clauset, clauset_inputs, daily_metrics, node_key  # noqa: E402
@@ -46,6 +51,8 @@ ap.add_argument("--boot", type=int, default=1000)
 ap.add_argument("--seeds", type=int, default=20)
 ap.add_argument("--worlds", default="0,1,2")
 ap.add_argument("--tag", default="")
+ap.add_argument("--split", default="val", choices=("val", "test"))
+ap.add_argument("--out", default=None, help="output directory (default: the P3b root)")
 ap.add_argument("--skip", default="", help="comma list of sections to skip (plumbing smoke tests only)")
 ap.add_argument("--plumb", action="store_true",
                 help="plumbing smoke test with NO val access: loads train only; pseudo-val = every 5th train group by id")
@@ -57,7 +64,8 @@ SKIP = set(filter(None, a.skip.split(",")))
 SENTINELS = ("end_balance", "net_flow", "ends_near_zero", "sweep_out_share", "min_balance")
 ATT_ALL = ("p3b0", "p3b1", None)  # None = the P3a zero-sharing anchor
 t0 = time.time()
-L, res, PRED = [], {"worlds": WORLDS, "boot": a.boot, "seeds": a.seeds}, {}
+L, res, PRED = [], {"eval_split": a.split, "worlds": WORLDS, "boot": a.boot, "seeds": a.seeds}, {}
+OUTDIR = Path(a.out) if a.out else C.ROOT
 
 
 def log(s):
@@ -80,16 +88,16 @@ XGB_ONLY = ("confonly", "noprof+S")
 S_DEP = ("L+S", "S", "full+S", "noprof+S")
 
 # ------------------------------------------------------------------ real
-R = load(("train",)) if a.plumb else load()
+R = load(("train",)) if a.plumb else load(("train", a.split))
 if a.plumb:
     _tr = R.st.agents("train")
     _pv = (R.group[_tr] % 5) == 0
-    _SPL = {"train": _tr[~_pv], "val": _tr[_pv]}
+    _SPL = {"train": _tr[~_pv], a.split: _tr[_pv]}
     R.agents = lambda split: _SPL[split]  # instance override: real_view / real_pop / real_transactions see the pseudo split
 st = R.st
-Atr, Ava = R.agents("train"), R.agents("val")
+Atr, Ava = R.agents("train"), R.agents(a.split)  # Ava / *V: the evaluation split (development names kept)
 agT, evT, FT, (BT, nT) = C.real_view(R, "train")
-agV, evV, FV, (BV, nV) = C.real_view(R, "val")
+agV, evV, FV, (BV, nV) = C.real_view(R, a.split)
 ytr, yva = st.role[Atr], st.role[Ava]
 gtr, gva = R.group[Atr], R.group[Ava]
 prev_va = float(yva.mean())
@@ -101,12 +109,18 @@ keep = np.flatnonzero(gva != giant)
 SV_rm = stack(struct_features(BV[keep]))
 XV_rm = fsets(FV[pl.Series(keep)], SV_rm)
 boot = GroupBoot(gva, B=a.boot)
-MATCH = Matcher(FT, ytr).match(FV, yva)  # the saved P3a rule; reproduces P3a's 348 val pairs on the guarded store
-if not a.plumb:
-    assert MATCH["n_pairs"] == 348, MATCH["n_pairs"]
+MATCH = Matcher(FT, ytr).match(FV, yva)  # the saved P3a rule (348 val pairs); no count is asserted (§J4.2)
 res["matching"] = {k: v for k, v in MATCH.items() if k != "pairs"}
 res["real"] = {"n_train": int(len(ytr)), "n_val": int(len(yva)), "prev_val": prev_va, "giant_group": giant,
-               "giant_size": int((gva == giant).sum()), "giant_scam": int(yva[gva == giant].sum())}
+               "giant_size": int((gva == giant).sum()), "giant_scam": int(yva[gva == giant].sum()),
+               "n_groups": int(len(ug)), "inverse_size_herfindahl": float(1 / ((uc / uc.sum()) ** 2).sum())}
+# clean subset (joint addendum §J4.3): P0 rule, fixed scores and full-split STRUCT; the frozen matcher rerun inside it
+CL = np.flatnonzero(clean_agents(R, a.split))
+bootC = GroupBoot(gva[CL], B=a.boot)
+MATCH_C = Matcher(FT, ytr).match(FV[pl.Series(CL)], yva[CL]) if len(CL) else {"pairs": np.zeros((0, 2), np.int64), "n_pairs": 0, "testable": False}
+pidxC = CL[np.concatenate([MATCH_C["pairs"][:, 0], MATCH_C["pairs"][:, 1]])] if MATCH_C["n_pairs"] else np.array([], np.int64)
+res["clean"] = {"n_agents": int(len(CL)), "n_scam": int(yva[CL].sum()), "n_groups": int(len(np.unique(gva[CL]))),
+                "matching": {k: v for k, v in MATCH_C.items() if k != "pairs"}}
 log(f"real: train {len(ytr)}, val {len(yva)}; giant val group {giant} ({(gva == giant).sum()} agents, {yva[gva == giant].sum()} scam)")
 
 # ------------------------------------------------------------------ synthetic bases
@@ -214,6 +228,11 @@ if "utility" not in SKIP:
                                                   [s[0] for s in tstr[("full", d, "p3b0")]],
                                                   {att: [s[0] for s in tstr[("full+S", d, att)]] for att in ("p3b0", "p3b1")}) for d in DETECTORS}
         A["struct_only"] = {att: transfer_contrast(yva, [s[0] for s in tstr[("S", PRIMARY, att)]], trtr[("S", PRIMARY)][0], boot) for att in ("p3b0", "p3b1")}
+        def matched_aucs(idx):  # matched TRTR and TSTR AUC point estimates, primary detector (joint addendum §J4.2)
+            au = lambda s: scores(yva[idx], s[idx])["auc"]  # noqa: E731
+            return {"trtr": {fs: au(trtr[(fs, d)][0]) for fs, d in trtr if d == PRIMARY},
+                    "tstr_mean": {f"{fs}/{att}": float(np.mean([au(s[0]) for s in v])) for (fs, d, att), v in tstr.items() if d == PRIMARY}}
+
         # matched pairs (saved P3a rule), full-split STRUCT
         M = MATCH
         pidx = np.concatenate([M["pairs"][:, 0], M["pairs"][:, 1]])
@@ -227,6 +246,7 @@ if "utility" not in SKIP:
             mt["behavioural_gain"] = {"trtr": au(trtr[("full+S", PRIMARY)][0]) - au(trtr[("confonly", PRIMARY)][0]),
                                       **{f"tstr_{att}": float(np.mean([au(s[0]) for s in tstr[("full+S", PRIMARY, att)]]) -
                                                               np.mean([au(s[0]) for s in tstr[("confonly", PRIMARY, att)]])) for att in ("p3b0", "p3b1")}}
+            mt["auc"] = matched_aucs(pidx)
         A["matched"] = mt
         # giant group: fixed scores without it; graph removal (recomputed val STRUCT, same models)
         A["giant_fixed"] = E.point_incremental(yva, trtr[("L", PRIMARY)][0], trtr[("L+S", PRIMARY)][0], [s[0] for s in tstr[("L", PRIMARY, "p3b0")]],
@@ -234,6 +254,25 @@ if "utility" not in SKIP:
         A["giant_graph_removed"] = E.point_incremental(yva[keep], trtr[("L", PRIMARY)][1], trtr[("L+S", PRIMARY)][1],
                                                        [s[1] for s in tstr[("L", PRIMARY, "p3b0")]],
                                                        {att: [s[1] for s in tstr[("L+S", PRIMARY, att)]] for att in ("p3b0", "p3b1")})
+        # clean subset (§J4.3), XGB, nominal: R / T / D / H on L and full bases, D_S, and clean + matched point estimates
+        def _inc(base, idx, draws):
+            fs, fsS = base, f"{base}+S"
+            return E.incremental(yva[idx], draws, trtr[(fs, PRIMARY)][0][idx], trtr[(fsS, PRIMARY)][0][idx],
+                                 [s[0][idx] for s in tstr[(fs, PRIMARY, "p3b0")]],
+                                 {att: [s[0][idx] for s in tstr[(fsS, PRIMARY, att)]] for att in ("p3b0", "p3b1")})
+        A["clean"] = {"incremental_L": _inc("L", CL, bootC.idx), "incremental_full": _inc("full", CL, bootC.idx),
+                      "struct_only": {att: transfer_contrast(yva[CL], [s[0][CL] for s in tstr[("S", PRIMARY, att)]], trtr[("S", PRIMARY)][0][CL], bootC)
+                                      for att in ("p3b0", "p3b1")}}
+        cmt = {"n_pairs": int(MATCH_C["n_pairs"]), "testable": bool(MATCH_C["n_pairs"] >= MIN_PAIRS)}
+        if cmt["testable"]:
+            cmt["L"] = _inc("L", pidxC, [])["point"]
+            cmt["full"] = _inc("full", pidxC, [])["point"]
+            auc_ = lambda s: scores(yva[pidxC], s[pidxC])["auc"]  # noqa: E731
+            cmt["behavioural_gain"] = {"trtr": auc_(trtr[("full+S", PRIMARY)][0]) - auc_(trtr[("confonly", PRIMARY)][0]),
+                                       **{f"tstr_{att}": float(np.mean([auc_(s[0]) for s in tstr[("full+S", PRIMARY, att)]]) -
+                                                               np.mean([auc_(s[0]) for s in tstr[("confonly", PRIMARY, att)]])) for att in ("p3b0", "p3b1")}}
+            cmt["auc"] = matched_aucs(pidxC)
+        A["clean_matched"] = cmt
         # arm-level means over worlds
         ws = list(per_world.values())
         agg = {}
@@ -563,7 +602,7 @@ np.minimum.at(gmin, coo.col, gva[coo.row])
 np.maximum.at(gmax, coo.col, gva[coo.row])
 sh = dV >= 2
 diag["val_cross_group_share_of_shared_incidence"] = float(((gmin != gmax) & sh)[coo.col].sum() / sh[coo.col].sum())
-pv, _ = real_pop(R, "val")
+pv, _ = real_pop(R, a.split)
 rv = replay(pv, keep_ptr=False)
 diag["val_cocreate_share"] = float(rv.opp_cocreate.mean())
 diag["val_first_touch_nonempty"] = float((rv.opp_nc > 0).mean())
@@ -600,11 +639,11 @@ CODE = ["src/lpw/p3b/access.py", "src/lpw/p3b/replay.py", "src/lpw/p3b/groups.py
         "scripts/p3a/common.py"]
 res["sha256"] = {c: sha(c) for c in CODE}
 res["sec"] = round(time.time() - t0)
-outs = [C.ROOT / f"readout_predictions{a.tag}.npz", C.ROOT / f"readout_samples{a.tag}.npz", C.ROOT / f"readout{a.tag}.json",
-        C.ROOT / f"readout{a.tag}.txt"]
+outs = [OUTDIR / f"readout_predictions{a.tag}.npz", OUTDIR / f"readout_samples{a.tag}.npz", OUTDIR / f"readout{a.tag}.json",
+        OUTDIR / f"readout{a.tag}.txt"]
 np.savez_compressed(outs[0], **PRED)
 np.savez_compressed(outs[1], **samples)
 C.save_json(outs[2], res)
 outs[3].write_text("\n".join(L) + "\n")
-C.save_json(C.ROOT / f"readout_manifest{a.tag}.json", {str(p): sha(p) for p in outs})
+C.save_json(OUTDIR / f"readout_manifest{a.tag}.json", {str(p): sha(p) for p in outs})
 log(f"done {res['sec']}s")

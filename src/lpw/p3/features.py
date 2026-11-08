@@ -55,7 +55,9 @@ def node_features(ag: pl.DataFrame, ev: pl.DataFrame, w_start: int, w_end: int) 
         first=pl.col("ts").min(), last=pl.col("ts").max(),
         med_log_gap=pl.col("gap").drop_nulls().log1p().median(), same_sec=(pl.col("gap") == 0).sum(),
         hour_entropy=pl.col("hour").value_counts().struct.field("count").map_batches(
-            lambda c: pl.Series([float(-(p := c.to_numpy() / c.sum()) @ np.log(p))]), returns_scalar=True),
+            # counts sorted first: value_counts() returns hash order, which varies run to run, and the dot product's
+            # summation order then moved the entropy by ~1e-15 (reports/p3_joint_rehearsal.md R2)
+            lambda c: pl.Series([float(-(p := np.sort(c.to_numpy()) / c.sum()) @ np.log(p))]), returns_scalar=True),
         weekend=(pl.col("dow") >= 5).mean(),
         out_amt_med=pl.col("amt").filter(out_).median(), out_amt_max=pl.col("amt").filter(out_).max(),
         in_amt_med=pl.col("amt").filter(~out_).median(), in_amt_max=pl.col("amt").filter(~out_).max(),

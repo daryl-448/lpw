@@ -2,7 +2,7 @@
 
 The sealed test split never reaches a frame: agent rows are filtered by split inside the parquet scan, and events,
 profiles and labelled-contract flags by the kept node ids, before collection (lpw.p1.store.build_store(splits=...)).
-Every development API here rejects 'test'.
+Every API here rejects 'test' unless lpw.sealed.authorize() has passed in this process (joint addendum §J7).
 
 Real(...) adds what P3a's observation schema drops: the global counterparty id of every event (raw events.cp), its
 transaction identity and the cp_is_agent flag, aligned one-to-one with the store's event order, plus Louvain group ids.
@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from lpw import sealed
 from lpw.p1.store import Store, build_store
 
 PILOT = Path("data/pilot_2018")
@@ -29,12 +30,13 @@ class Real:
     group: np.ndarray     # (n_agents,) int64 Louvain group id
 
     def agents(self, split: str) -> np.ndarray:
-        assert split in DEV_SPLITS, "the sealed test split is opened once, with authorization"
+        sealed.require(split)
         return self.st.agents(split)
 
 
 def load(splits: tuple[str, ...] = DEV_SPLITS, pilot: Path = PILOT) -> Real:
-    assert set(splits) <= set(DEV_SPLITS), "development access is train / val only"
+    for s in splits:  # train / val always; test only after lpw.sealed.authorize() (joint addendum §J7)
+        sealed.require(s)
     st = build_store(pilot, splits=splits)
     keep = pl.Series(st.node_id).implode()
     ev = (pl.scan_parquet(pilot / "events.parquet").filter(pl.col("node_id").is_in(keep)).collect()
@@ -64,3 +66,22 @@ def real_pop(R: Real, split: str):
     return Pop(group=R.group[ag], role=st.role[ag], cohort=st.cohort[ag], origin=st.origin[ag], off=off,
                sec=st.ts[idx].astype(np.int64), out=st.kind[idx] == OUT, elig=(st.venue[idx] < 0) & ~R.cp_agent[idx],
                first=st.cls[idx] == NEW, ent=st.ent[idx].astype(np.int64), cp=R.cp[idx], rank=rank, w_start=st.w_start, w_end=st.w_end), idx
+
+
+def clean_agents(R: Real, split: str) -> np.ndarray:
+    """Boolean mask over R.agents(split): True if none of the agent's non-venue counterparties occurs among the train
+    agents' non-venue counterparties. This is the P0 rule of lpw.data.audit.leakage_report (joint addendum §J4.3)."""
+    st = R.st
+
+    def cps(agents):
+        idx = np.concatenate([np.arange(st.off[a], st.off[a + 1]) for a in agents])
+        idx = idx[st.venue[idx] < 0]
+        return idx, R.cp[idx]
+
+    _, tr_cp = cps(R.agents("train"))
+    ev_agents = R.agents(split)
+    idx, cp = cps(ev_agents)
+    hit = np.isin(cp, np.unique(tr_cp))
+    owner = np.searchsorted(st.off, idx, side="right") - 1  # store agent of each event
+    dirty = np.unique(owner[hit])
+    return ~np.isin(ev_agents, dirty)

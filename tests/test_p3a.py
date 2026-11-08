@@ -194,3 +194,19 @@ def test_f1_threshold_reaches_the_best_oof_f1():
     y = (rng.random(600) < 0.3).astype(int)
     X = (y + rng.normal(0, 1.0, len(y)))[:, None]
     assert 0.0 < f1_threshold("lr", X, y) < 1.0
+
+
+def test_hour_entropy_is_bitwise_equal_for_equal_hour_count_multisets():
+    """value_counts() returns hash order; the entropy must not depend on it (reports/p3_joint_rehearsal.md R2)."""
+    rng = np.random.default_rng(4)
+    counts = [7, 5, 3, 3, 2, 1, 1, 1, 1]  # one hour-count multiset, laid on different hours for every agent
+    n_ag, evs = 40, []
+    for a in range(n_ag):
+        hours = rng.permutation(24)[:len(counts)]
+        for h, c in zip(hours, counts):
+            evs += [(a, IN, W0 + int(h) * 3600 + 60 * k, 1.0, 0.0, 3, -1) for k in range(c)]
+    evs.sort(key=lambda e: (e[0], e[2]))
+    ag, ev = _obs(evs, b0=(1.0,) * n_ag, cohort=(0,) * n_ag)
+    for _ in range(3):
+        h = node_features(ag, ev, W0, W1)["hour_entropy"].to_numpy()
+        assert (h == h[0]).all()

@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from lpw import sealed
 from lpw.p1.store import build_store
 from lpw.p3.features import node_features
 from lpw.p3.observe import observe_real, observe_synth
@@ -17,8 +18,15 @@ def store():
     return build_store(PILOT)
 
 
+def store_for(split):
+    """Guarded store with train and one evaluation split only (joint addendum §J7); test needs lpw.sealed.authorize()."""
+    sealed.require(split)
+    return build_store(PILOT, splits=("train", split))
+
+
 def group_ids(st, agents) -> np.ndarray:
-    ag = pl.read_parquet(PILOT / "agents.parquet")
+    ids = pl.Series([int(x) for x in st.node_id[agents]], dtype=pl.UInt64).implode()
+    ag = pl.scan_parquet(PILOT / "agents.parquet").filter(pl.col("node_id").is_in(ids)).select("node_id", "group_id").collect()
     gid = dict(zip(ag["node_id"].to_list(), ag["group_id"].to_list()))
     return np.array([gid[int(st.node_id[a])] for a in agents])
 
@@ -26,7 +34,7 @@ def group_ids(st, agents) -> np.ndarray:
 def real(st, split, owned_only=False):
     """(observed agents, observed events, node features) of a real split. Never called with 'test' before the
     authorized sealed evaluation."""
-    assert split in ("train", "val"), "the sealed test split is opened once, with authorization"
+    sealed.require(split)
     ag, ev = observe_real(st, st.agents(split), owned_only=owned_only)
     return ag, ev, node_features(ag, ev, st.w_start, st.w_end)
 
